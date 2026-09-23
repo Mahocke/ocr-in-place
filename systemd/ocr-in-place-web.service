@@ -1,0 +1,15 @@
+[Unit]
+Description=ocr-in-place progress page
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/ocr-in-place-web
+Environment=OCR_WEB_PORT=8099
+# Loopback by default. The page has no authentication and shows file paths -
+# only widen this on a network you trust, or put a proxy in front of it.
+Environment=OCR_WEB_BIND=127.0.0.1
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

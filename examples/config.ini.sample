@@ -1,0 +1,7 @@
+# Copy to /etc/ocr-in-place/config.ini and chmod 600.
+# This secret can read and write every document in the tenant.
+
+[graph]
+tenant        = contoso.onmicrosoft.com
+client_id     = 00000000-0000-0000-0000-000000000000
+client_secret = 

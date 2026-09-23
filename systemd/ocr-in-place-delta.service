@@ -1,0 +1,12 @@
+[Unit]
+Description=ocr-in-place delta run: make new PDFs searchable
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/flock -n /run/lock/ocr-in-place-delta.lock /usr/local/sbin/ocr-in-place-delta.sh
+# Stop after four hours, whatever happens. Being cut off is harmless: uploads
+# are atomic and the journal picks up where it left off next time.
+RuntimeMaxSec=14400
+Nice=10

@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+"""ocr-in-place-worker - does the OCR work without ever seeing a credential.
+
+Runs as a long-lived process, normally started by the coordinator over ssh.
+Reads one job per line as JSON on stdin and writes one result per line as JSON
+on stdout.
+
+It fetches the file through a pre-authorised download URL handed to it by the
+coordinator and writes the result back through an upload URL obtained the same
+way. Both URLs are valid for one single file and roughly one hour. The document
+therefore never travels through the coordinator, and no worker holds a secret
+that would let it reach anything else.
+
+Job:     {"id", "mode": "probe|scan|ocr", "download", "upload", ...}
+Result:  {"id", "ok", "status", "pages", "textpages", ...}
+
+Standard library only. Needs ocrmypdf, tesseract and poppler-utils on PATH.
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+# Homebrew first: on macOS the system PATH of a non-interactive ssh session
+# does not contain /opt/homebrew/bin.
+os.environ["PATH"] = ("/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:"
+                      + os.environ.get("PATH", ""))
+MIN_CHARS = 50          # a page counts as "has text" from this many characters
+BLOCK = 8 * 1024 * 1024
+TOOLS = ("ocrmypdf", "tesseract", "pdftotext", "pdfinfo", "pdfsig")
+
+
+class Throttled(RuntimeError):
+    """The other side is rate limiting us. Not a file defect - retry later."""
+
+
+class OcrError(RuntimeError):
+    def __init__(self, code, text):
+        super().__init__(text)
+        self.code = code
+
+
+# ---------- transfer ----------
+
+def fetch(url, target):
+    for attempt in range(6):
+        try:
+            with urllib.request.urlopen(url, timeout=900) as r, open(target, "wb") as f:
+                shutil.copyfileobj(r, f, 1024 * 1024)
+            return
+        except urllib.error.HTTPError as e:
+            if e.code not in (429, 500, 502, 503, 504):
+                raise
+            if attempt == 5:
+                raise Throttled(f"HTTP {e.code} after 6 attempts")
+            wait = 0
+            try:
+                wait = int(e.headers.get("Retry-After") or 0)
+            except Exception:
+                pass
+            time.sleep(min(120, wait or 3 * 2 ** attempt))
+        except (urllib.error.URLError, TimeoutError) as e:
+            if attempt == 5:
+                raise Throttled(f"network error after 6 attempts: {e}")
+            time.sleep(3 * 2 ** attempt)
+
+
+def upload(url, path):
+    """Send the file to an upload session in chunks. The URL carries its own
+    authorisation - an Authorization header must NOT be added."""
+    size = os.path.getsize(path)
+    last = None
+    with open(path, "rb") as f:
+        off = 0
+        while off < size:
+            buf = f.read(BLOCK)
+            if not buf:
+                break
+            end = off + len(buf) - 1
+            req = urllib.request.Request(url, data=buf, method="PUT")
+            req.add_header("Content-Length", str(len(buf)))
+            req.add_header("Content-Range", f"bytes {off}-{end}/{size}")
+            for attempt in range(4):
+                try:
+                    with urllib.request.urlopen(req, timeout=900) as r:
+                        last = r.read()
+                    break
+                except urllib.error.HTTPError as e:
+                    if e.code in (429, 500, 502, 503, 504) and attempt < 3:
+                        time.sleep(2 ** attempt)
+                        continue
+                    raise RuntimeError(f"upload {off}-{end}: HTTP {e.code} "
+                                       f"{e.read()[:200].decode('utf-8', 'replace')}")
+            off += len(buf)
+    try:
+        return json.loads(last) if last else {}
+    except Exception:
+        return {}
+
+
+# ---------- classification ----------
+
+def page_count(path):
+    r = subprocess.run(["pdfinfo", path], capture_output=True, text=True, timeout=120)
+    m = re.search(r"^Pages:\s+(\d+)", r.stdout, re.M)
+    return int(m.group(1)) if m else 0
+
+
+def is_signed(path):
+    """pdfsig reports any embedded signature. OCR would invalidate it."""
+    try:
+        r = subprocess.run(["pdfsig", path], capture_output=True, text=True, timeout=120)
+    except Exception:
+        return False
+    return "Signature #" in r.stdout
+
+
+def text_pages(path):
+    r = subprocess.run(["pdftotext", "-q", path, "-"], capture_output=True, timeout=600)
+    txt = r.stdout.decode("utf-8", "replace")
+    pages = txt.split("\f")[:-1] or [txt]
+    return sum(1 for p in pages if len(re.sub(r"\s", "", p)) >= MIN_CHARS)
+
+
+def classify(path):
+    n = page_count(path)
+    if n == 0:
+        return "broken", 0, 0, "no pages, or unreadable"
+    if is_signed(path):
+        return "signed", n, 0, "digital signature"
+    t = text_pages(path)
+    if t == 0:
+        return "image", n, 0, ""
+    if t < n:
+        return "partial", n, t, ""
+    return "text", n, t, ""
+
+
+# ---------- OCR ----------
+
+def _run_ocr(source, target, job, kind):
+    cmd = ["nice", "-n", str(job.get("nice", 10)), "ocrmypdf", "--skip-text",
+           "-l", job.get("lang", "eng"), "--jobs", str(job.get("jobs", 3)),
+           "--output-type", kind, "--tesseract-timeout", "600", "--quiet",
+           source, target]
+    r = subprocess.run(cmd, capture_output=True, timeout=job.get("timeout", 3600))
+    if r.returncode != 0:
+        raise OcrError(r.returncode,
+                       (r.stderr.decode("utf-8", "replace").strip()
+                        or "ocrmypdf failed")[:300])
+
+
+def ocr(source, target, job):
+    """Returns the output type that was used.
+
+    The normal case is 'pdf': page content is passed through untouched and only
+    the text layer is added. Some old scans contain damaged JPEG data; qpdf
+    refuses to pass those through and ocrmypdf aborts with exit code 4
+    ("output file is invalid"). Only then do we fall back to 'pdfa', where
+    Ghostscript rebuilds the pages and repairs the image on the way. Every
+    other error stays an error, so nothing questionable gets uploaded."""
+    kind = "pdfa" if job.get("pdfa") else "pdf"
+    try:
+        _run_ocr(source, target, job, kind)
+        return kind
+    except OcrError as e:
+        if kind != "pdf" or e.code != 4:
+            raise
+        _run_ocr(source, target, job, "pdfa")
+        return "pdfa"
+
+
+# ---------- one job ----------
+
+def handle(job, workdir, ask=None):
+    if job.get("mode") == "probe":
+        v = subprocess.run(["ocrmypdf", "--version"],
+                           capture_output=True, text=True).stdout.strip()
+        missing = [t for t in TOOLS if shutil.which(t) is None]
+        return {"id": job.get("id"), "ok": not missing, "ocrmypdf": v,
+                "error": ("missing: " + ", ".join(missing)) if missing else None}
+
+    source = os.path.join(workdir, "in.pdf")
+    target = os.path.join(workdir, "out.pdf")
+    for f in (source, target):
+        if os.path.exists(f):
+            os.remove(f)
+
+    t0 = time.time()
+    fetch(job["download"], source)
+    status, pages, tpages, note = classify(source)
+    res = {"id": job["id"], "ok": True, "status": status, "pages": pages,
+           "textpages": tpages, "note": note,
+           "size_before": os.path.getsize(source), "uploaded": False}
+    if job.get("mode") == "scan" or status not in ("image", "partial"):
+        res["seconds"] = round(time.time() - t0, 1)
+        return res
+
+    res["output"] = ocr(source, target, job)
+    n_status, n_pages, n_text, n_note = classify(target)
+    res["size_after"] = os.path.getsize(target)
+    res["textpages_after"] = n_text
+
+    if n_status in ("broken", "protected") or n_pages != pages:
+        res["ok"] = False
+        res["error"] = f"verify: {n_status} {n_pages}p instead of {pages}p {n_note}"
+    elif n_text <= tpages:
+        res["result"] = "no-gain"
+    else:
+        url = job.get("upload")
+        if job.get("twophase") and ask:
+            # Only now ask for the upload address. At this moment the
+            # coordinator checks whether someone else changed the file in the
+            # meantime, which keeps that window as small as it can be.
+            answer = ask({"id": job["id"], "phase": "ready", "pages": pages,
+                          "textpages": tpages, "textpages_after": n_text,
+                          "size_before": res["size_before"],
+                          "size_after": res["size_after"]})
+            url = answer.get("upload")
+            if not url:
+                res["result"] = "aborted"
+                res["note"] = answer.get("reason", "refused by the coordinator")
+                res["seconds"] = round(time.time() - t0, 1)
+                return res
+        if url:
+            new = upload(url, target)
+            res["uploaded"] = True
+            res["ctag"] = new.get("cTag") or new.get("eTag") or ""
+            res["mtime"] = (new.get("fileSystemInfo") or {}).get(
+                "lastModifiedDateTime", "")
+    res["seconds"] = round(time.time() - t0, 1)
+    return res
+
+
+def ask_coordinator(message):
+    print(json.dumps(message, ensure_ascii=False), flush=True)
+    answer = sys.stdin.readline()
+    if not answer:
+        raise RuntimeError("the coordinator stopped answering")
+    return json.loads(answer)
+
+
+def main():
+    workdir = tempfile.mkdtemp(prefix="ocr-in-place-")
+    try:
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                job = json.loads(line)
+            except Exception as e:
+                print(json.dumps({"ok": False, "error": f"malformed job: {e}"}),
+                      flush=True)
+                continue
+            try:
+                res = handle(job, workdir, ask_coordinator)
+            except Throttled as e:
+                res = {"id": job.get("id"), "ok": False, "transient": True,
+                       "error": str(e)[:400]}
+            except Exception as e:
+                res = {"id": job.get("id"), "ok": False, "error": str(e)[:400]}
+            print(json.dumps(res, ensure_ascii=False), flush=True)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    main()

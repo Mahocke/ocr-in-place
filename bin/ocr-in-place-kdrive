@@ -1,0 +1,492 @@
+#!/usr/bin/env python3
+"""ocr-in-place-kdrive - the same idea for Infomaniak kDrive.
+
+Download the file, add an invisible text layer with ocrmypdf, write it back
+onto the SAME file_id (POST /3/drive/<d>/upload?file_id=...). File ID, name and
+path stay as they were, kDrive records a new version, and the original remains
+recoverable through POST /2/drive/<d>/files/<id>/versions/<v>/restore.
+
+This variant does everything on one machine - kDrive hands out no
+pre-authorised URLs, so there is nothing to delegate to a worker.
+
+  ocr-in-place-kdrive drives                      which drives the token can see
+  ocr-in-place-kdrive --drive N ls [FOLDER]       list a folder (ID or path)
+  ocr-in-place-kdrive --drive N scan FOLDER [-r]  read only: classify PDFs
+  ocr-in-place-kdrive --drive N run FOLDER [-r] --yes
+  ocr-in-place-kdrive --drive N report
+
+The API token is read from the environment (KDRIVE_TOKEN) or from a file,
+default /etc/ocr-in-place/kdrive-token, overridable with KDRIVE_TOKEN_FILE.
+Create one at manager.infomaniak.com with the scope "drive"; it must belong to
+a user of the account that owns the drive.
+
+Same safety nets as the SharePoint tool: signed PDFs are never touched, the
+result is verified for page count and text gain, and the version counter must
+rise or the run aborts.
+"""
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+API = "https://api.infomaniak.com"
+TOKEN_FILE = os.environ.get("KDRIVE_TOKEN_FILE", "/etc/ocr-in-place/kdrive-token")
+STATE = os.environ.get("OCR_STATE", "/var/lib/ocr-in-place")
+CACHE = os.environ.get("OCR_CACHE", "/var/cache/ocr-in-place")
+DB = os.path.join(STATE, "kdrive.sqlite")
+WORK = os.path.join(CACHE, "kdrive")
+MIN_CHARS = 50
+CANDIDATES = ("image", "partial")
+WRITE = threading.Lock()
+_tls = threading.local()
+
+
+def token():
+    if not hasattr(_tls, "t"):
+        t = os.environ.get("KDRIVE_TOKEN")
+        if not t:
+            try:
+                with open(TOKEN_FILE) as f:
+                    t = f.read().strip()
+            except OSError:
+                raise SystemExit(f"no token: set KDRIVE_TOKEN or create {TOKEN_FILE} "
+                                 f"(see docs/SETUP-KDRIVE.md)")
+        _tls.t = t
+    return _tls.t
+
+
+# ---------- API ----------
+
+def api(path, method="GET", data=None, raw=False, attempts=5):
+    for n in range(attempts):
+        req = urllib.request.Request(
+            API + path, method=method, data=data,
+            headers={"Authorization": "Bearer " + token(),
+                     "Accept": "application/json"})
+        if data is not None:
+            req.add_header("Content-Type", "application/octet-stream")
+        try:
+            with urllib.request.urlopen(req, timeout=900) as r:
+                body = r.read()
+                return body if raw else json.loads(body).get("data")
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 500, 502, 503, 504) and n < attempts - 1:
+                wait = 0
+                try:
+                    wait = int(e.headers.get("Retry-After") or 0)
+                except Exception:
+                    pass
+                time.sleep(min(120, wait or 3 * 2 ** n))
+                continue
+            raise RuntimeError(f"HTTP {e.code} on {path}: "
+                               f"{e.read()[:200].decode('utf-8', 'replace')}")
+        except (urllib.error.URLError, TimeoutError) as e:
+            if n < attempts - 1:
+                time.sleep(3 * 2 ** n)
+                continue
+            raise RuntimeError(f"network error on {path}: {e}")
+
+
+def children(drive, folder, per_page=200):
+    out, page = [], 1
+    while True:
+        part = api(f"/2/drive/{drive}/files/{folder}/files"
+                   f"?per_page={per_page}&page={page}") or []
+        out += part
+        if len(part) < per_page:
+            return out
+        page += 1
+
+
+def resolve(drive, ref):
+    """FOLDER may be an ID or a path such as 'Common documents/Invoices'."""
+    if str(ref).isdigit():
+        return int(ref)
+    current = 1
+    for part in str(ref).strip("/").split("/"):
+        if not part:
+            continue
+        hit = [k for k in children(drive, current)
+               if k.get("type") == "dir" and k.get("name") == part]
+        if not hit:
+            raise SystemExit(f"folder not found: {part}")
+        current = hit[0]["id"]
+    return current
+
+
+def version_count(drive, fid):
+    try:
+        return len(api(f"/2/drive/{drive}/files/{fid}/versions") or [])
+    except Exception:
+        return -1
+
+
+def fetch(drive, fid, target):
+    with open(target, "wb") as f:
+        f.write(api(f"/2/drive/{drive}/files/{fid}/download", raw=True))
+
+
+def replace(drive, fid, local):
+    """Replace the contents of an existing file -> new version, no new file."""
+    with open(local, "rb") as f:
+        body = f.read()
+    # total_size=0 does not fail - it empties the file. Never send an empty body.
+    if not body:
+        raise RuntimeError("empty file - refusing to upload")
+    q = urllib.parse.urlencode({"file_id": fid, "total_size": len(body)})
+    return api(f"/3/drive/{drive}/upload?{q}", method="POST", data=body)
+
+
+# ---------- PDF ----------
+
+def page_count(p):
+    t = subprocess.run(["pdfinfo", p], capture_output=True, text=True, timeout=120).stdout
+    m = re.search(r"^Pages:\s+(\d+)", t, re.M)
+    return int(m.group(1)) if m else 0
+
+
+def is_signed(p):
+    try:
+        r = subprocess.run(["pdfsig", p], capture_output=True, text=True, timeout=120)
+    except Exception:
+        return False
+    return "Signature #" in r.stdout
+
+
+def text_pages(p):
+    r = subprocess.run(["pdftotext", "-q", p, "-"], capture_output=True, timeout=600)
+    txt = r.stdout.decode("utf-8", "replace")
+    pages = txt.split("\f")[:-1] or [txt]
+    return sum(1 for s in pages if len(re.sub(r"\s", "", s)) >= MIN_CHARS)
+
+
+def classify(p):
+    n = page_count(p)
+    if n == 0:
+        return "broken", 0, 0, "no pages, or unreadable"
+    if is_signed(p):
+        return "signed", n, 0, "digital signature"
+    t = text_pages(p)
+    if t == 0:
+        return "image", n, 0, ""
+    if t < n:
+        return "partial", n, t, ""
+    return "text", n, t, ""
+
+
+class OcrError(RuntimeError):
+    def __init__(self, code, text):
+        super().__init__(text)
+        self.code = code
+
+
+def _run_ocr(src, dst, lang, jobs, kind, timeout):
+    cmd = ["nice", "-n", "10", "ocrmypdf", "--skip-text", "-l", lang,
+           "--jobs", str(jobs), "--output-type", kind,
+           "--tesseract-timeout", "600", "--quiet", src, dst]
+    r = subprocess.run(cmd, capture_output=True, timeout=timeout)
+    if r.returncode != 0:
+        raise OcrError(r.returncode,
+                       (r.stderr.decode("utf-8", "replace").strip()
+                        or "ocrmypdf failed")[:300])
+
+
+def ocr(src, dst, lang, jobs, timeout):
+    """Exit code 4 usually means damaged JPEG data in the original - then go
+    through PDF/A, where Ghostscript rebuilds and repairs the page."""
+    try:
+        _run_ocr(src, dst, lang, jobs, "pdf", timeout)
+        return "pdf"
+    except OcrError as e:
+        if e.code != 4:
+            raise
+        _run_ocr(src, dst, lang, jobs, "pdfa", timeout)
+        return "pdfa"
+
+
+# ---------- storage ----------
+
+def db():
+    if not hasattr(_tls, "c"):
+        os.makedirs(os.path.dirname(DB), exist_ok=True)
+        _tls.c = sqlite3.connect(DB, timeout=60, check_same_thread=False)
+        _tls.c.executescript("""
+        pragma journal_mode=wal;
+        create table if not exists items(
+          drive int, fid int, path text, size int, stamp text,
+          status text, pages int, textpages int, note text, checked_at text,
+          primary key(drive, fid));
+        create table if not exists ocr(
+          id integer primary key autoincrement,
+          drive int, fid int, path text, at text,
+          size_before int, size_after int, pages int,
+          textpages_before int, textpages_after int,
+          versions_before int, versions_after int,
+          output text, result text, note text, seconds real);
+        """)
+        _tls.c.commit()
+    return _tls.c
+
+
+def write(sql, values):
+    with WRITE:
+        c = db()
+        c.execute(sql, values)
+        c.commit()
+
+
+def now():
+    return dt.datetime.now().isoformat(timespec="seconds")
+
+
+def is_pdf(k):
+    return k.get("type") == "file" and (k.get("name") or "").lower().endswith(".pdf")
+
+
+def walk(drive, folder, recursive, path=""):
+    for k in children(drive, folder):
+        p = (path + "/" + (k.get("name") or "")).lstrip("/")
+        if k.get("type") == "dir":
+            if recursive:
+                yield from walk(drive, k["id"], True, p)
+        elif is_pdf(k):
+            yield k, p
+
+
+def need_drive(args):
+    if not args.drive:
+        raise SystemExit("--drive is required - 'ocr-in-place-kdrive drives' lists them")
+    return args.drive
+
+
+# ---------- commands ----------
+
+def cmd_drives(args):
+    for d in api("/2/drive") or []:
+        print(f"{d.get('id'):<12} {d.get('name', '')[:40]:<42} "
+              f"account {d.get('account_id', '')}")
+
+
+def cmd_ls(args):
+    drive = need_drive(args)
+    folder = resolve(drive, args.folder)
+    for k in sorted(children(drive, folder),
+                    key=lambda x: (x.get("type") != "dir", (x.get("name") or "").lower())):
+        print("%-5s %-52s id=%-10s %s" % (k.get("type"), (k.get("name") or "")[:52],
+                                          k.get("id"), k.get("size") or ""))
+
+
+def cmd_scan(args):
+    drive = need_drive(args)
+    folder = resolve(drive, args.folder)
+    os.makedirs(WORK, exist_ok=True)
+    c = db()
+    counts, n = {}, 0
+    tmp = os.path.join(WORK, "scan.pdf")
+    for k, p in walk(drive, folder, args.recursive):
+        n += 1
+        stamp = str(k.get("last_modified_at") or k.get("revised_at") or "")
+        known = c.execute("select status, pages, textpages, note from items "
+                          "where drive=? and fid=? and stamp=?",
+                          (drive, k["id"], stamp)).fetchone()
+        if known and not args.rescan:
+            status, pages, tp, note = known
+        else:
+            try:
+                fetch(drive, k["id"], tmp)
+                status, pages, tp, note = classify(tmp)
+            except Exception as e:
+                status, pages, tp, note = "broken", 0, 0, str(e)[:120]
+            finally:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            write("insert or replace into items values(?,?,?,?,?,?,?,?,?,?)",
+                  (drive, k["id"], p, k.get("size") or 0, stamp,
+                   status, pages, tp, note, now()))
+        counts[status] = counts.get(status, 0) + 1
+        if not args.quiet:
+            print("%5d %-10s %4dp %4dt  %s" % (n, status, pages, tp, p), flush=True)
+    print("\n%d PDF(s)" % n)
+    for s in sorted(counts, key=lambda x: -counts[x]):
+        print("  %-10s %5d" % (s, counts[s]))
+    print("\ncandidates for OCR: %d" % sum(counts.get(s, 0) for s in CANDIDATES))
+
+
+def cmd_run(args):
+    if not args.yes and not args.dry_run:
+        raise SystemExit("run writes new versions - confirm with --yes (or --dry-run)")
+    drive = need_drive(args)
+    folder = resolve(drive, args.folder)
+    os.makedirs(WORK, exist_ok=True)
+    c = db()
+    allowed = ("image",) if args.only_image else CANDIDATES
+    done = errors = skipped = vchecks = 0
+    src, dst = os.path.join(WORK, "in.pdf"), os.path.join(WORK, "out.pdf")
+
+    for k, p in walk(drive, folder, args.recursive):
+        if args.limit and done >= args.limit:
+            print("--limit %d reached" % args.limit)
+            break
+        stamp = str(k.get("last_modified_at") or k.get("revised_at") or "")
+        if c.execute("select 1 from ocr where drive=? and fid=? and result in ('ok','no-gain')",
+                     (drive, k["id"])).fetchone():
+            continue
+        known = c.execute("select status from items where drive=? and fid=? and stamp=?",
+                          (drive, k["id"], stamp)).fetchone()
+        if known and known[0] not in allowed:
+            continue
+        for f in (src, dst):
+            if os.path.exists(f):
+                os.remove(f)
+        try:
+            fetch(drive, k["id"], src)
+        except Exception as e:
+            errors += 1
+            print("ERROR        %s  [download: %s]" % (p, e), file=sys.stderr, flush=True)
+            continue
+        status, pages, tp, note = classify(src)
+        write("insert or replace into items values(?,?,?,?,?,?,?,?,?,?)",
+              (drive, k["id"], p, k.get("size") or 0, stamp,
+               status, pages, tp, note, now()))
+        if status not in allowed:
+            if status in ("signed", "broken"):
+                skipped += 1
+                print("untouched    %s  [%s]" % (p, status), flush=True)
+            continue
+
+        t0 = time.time()
+        try:
+            output = ocr(src, dst, args.lang, args.jobs, args.timeout)
+        except Exception as e:
+            errors += 1
+            print("ERROR        %s  [OCR: %s]" % (p, str(e)[:120]), file=sys.stderr, flush=True)
+            write("insert into ocr(drive,fid,path,at,result,note) values(?,?,?,?,?,?)",
+                  (drive, k["id"], p, now(), "ocr-error", str(e)[:300]))
+            continue
+        secs = time.time() - t0
+
+        n_status, n_pages, n_text, n_note = classify(dst)
+        if n_status == "broken" or n_pages != pages:
+            errors += 1
+            why = "verify: %s %dp instead of %dp %s" % (n_status, n_pages, pages, n_note)
+            print("ERROR        %s  [%s]" % (p, why), file=sys.stderr, flush=True)
+            write("insert into ocr(drive,fid,path,at,result,note) values(?,?,?,?,?,?)",
+                  (drive, k["id"], p, now(), "verify-failed", why[:300]))
+            continue
+        if n_text <= tp:
+            note = ("%d of %d pages already had text, nothing legible on the rest"
+                    % (tp, pages))
+            print("no gain      %s  [%s]" % (p, note), flush=True)
+            write("insert into ocr(drive,fid,path,at,pages,textpages_before,result,"
+                  "note,seconds) values(?,?,?,?,?,?,?,?,?)",
+                  (drive, k["id"], p, now(), pages, tp, "no-gain", note, secs))
+            continue
+
+        sz_b, sz_a = os.path.getsize(src), os.path.getsize(dst)
+        if args.dry_run:
+            done += 1
+            print("would OCR    %s  %dp  %d->%d text pages  %d -> %d kB  (%s, %.0fs)"
+                  % (p, pages, tp, n_text, sz_b // 1024, sz_a // 1024, output, secs),
+                  flush=True)
+            continue
+
+        check_v = vchecks < args.versions
+        v_before = version_count(drive, k["id"]) if check_v else -1
+        try:
+            replace(drive, k["id"], dst)
+        except Exception as e:
+            errors += 1
+            print("ERROR        %s  [upload: %s]" % (p, str(e)[:120]),
+                  file=sys.stderr, flush=True)
+            write("insert into ocr(drive,fid,path,at,result,note) values(?,?,?,?,?,?)",
+                  (drive, k["id"], p, now(), "upload-error", str(e)[:300]))
+            continue
+        v_after = version_count(drive, k["id"]) if check_v else -1
+        if check_v:
+            vchecks += 1
+        write("insert into ocr(drive,fid,path,at,size_before,size_after,pages,"
+              "textpages_before,textpages_after,versions_before,versions_after,"
+              "output,result,note,seconds) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+              (drive, k["id"], p, now(), sz_b, sz_a, pages, tp, n_text,
+               v_before, v_after, output, "ok",
+               "repaired via PDF/A" if output == "pdfa" else "", secs))
+        done += 1
+        vt = "v%d->%d  " % (v_before, v_after) if check_v else ""
+        print("OK           %s  %dp  %d->%d text pages  %d -> %d kB  %s(%.0fs)"
+              % (p, pages, tp, n_text, sz_b // 1024, sz_a // 1024, vt, secs), flush=True)
+        if check_v and v_before >= 0 and v_after <= v_before:
+            raise SystemExit("ABORTING: the version count did not rise - this kDrive "
+                             "does not appear to keep a version history.")
+    print("\nfinished: %d processed, %d skipped, %d error(s)" % (done, skipped, errors))
+
+
+def cmd_report(args):
+    c = db()
+    print("classification:")
+    for r in c.execute("select status, count(*), coalesce(sum(pages),0) from items "
+                       "group by 1 order by 2 desc"):
+        print("  %-10s %5d file(s) %7d page(s)" % r)
+    print("\nOCR results:")
+    for r in c.execute("select result, count(*) from ocr group by 1 order by 2 desc"):
+        print("  %-14s %5d" % r)
+    for r in c.execute("select at, result, path, note from ocr order by id desc limit ?",
+                       (args.limit,)):
+        print("  %s %-12s %s %s" % (r[0][11:], r[1], r[2][-60:], (r[3] or "")[:40]))
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="ocr-in-place-kdrive", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--drive", type=int, help="kDrive ID ('drives' lists them)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("drives", help="list the drives this token can see")
+    p.set_defaults(fn=cmd_drives)
+
+    p = sub.add_parser("ls", help="list a folder")
+    p.add_argument("folder", nargs="?", default="1")
+    p.set_defaults(fn=cmd_ls)
+
+    p = sub.add_parser("scan", help="classify PDFs (read only)")
+    p.add_argument("folder")
+    p.add_argument("-r", "--recursive", action="store_true")
+    p.add_argument("--rescan", action="store_true")
+    p.add_argument("--quiet", action="store_true")
+    p.set_defaults(fn=cmd_scan)
+
+    p = sub.add_parser("run", help="OCR and write back as a new version")
+    p.add_argument("folder")
+    p.add_argument("-r", "--recursive", action="store_true")
+    p.add_argument("--yes", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--limit", type=int, default=0)
+    p.add_argument("--only-image", dest="only_image", action="store_true")
+    p.add_argument("--lang", default="eng", help="tesseract languages, e.g. deu+eng")
+    p.add_argument("--jobs", type=int, default=3)
+    p.add_argument("--timeout", type=int, default=3600)
+    p.add_argument("--versions", type=int, default=5)
+    p.set_defaults(fn=cmd_run)
+
+    p = sub.add_parser("report", help="state from the database")
+    p.add_argument("--limit", type=int, default=15)
+    p.set_defaults(fn=cmd_report)
+
+    args = ap.parse_args()
+    try:
+        args.fn(args)
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,315 @@
+#!/usr/bin/env python3
+"""ocr-in-place-web - a small progress page for ocr-in-place.
+
+Opens the SQLite journal read-only and shows what scan and run have done so
+far. No credentials, no writes, nothing but the database.
+
+  OCR_WEB_BIND   default 127.0.0.1 - listen address
+  OCR_WEB_PORT   default 8099
+  OCR_STATE      default /var/lib/ocr-in-place
+
+An expected file count may be placed in <OCR_STATE>/target.txt so the page can
+show a percentage and an estimate:
+
+    999  contoso/Finance
+
+The default bind address is the loopback interface. Put it behind a reverse
+proxy, or set OCR_WEB_BIND=0.0.0.0 if the network it sits on is trusted - the
+page has no authentication and shows file paths.
+"""
+import datetime as dt
+import html
+import os
+import sqlite3
+import subprocess
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+STATE = os.environ.get("OCR_STATE", "/var/lib/ocr-in-place")
+DB = os.path.join(STATE, "sharepoint.sqlite")
+TARGET = os.path.join(STATE, "target.txt")
+BIND = os.environ.get("OCR_WEB_BIND", "127.0.0.1")
+PORT = int(os.environ.get("OCR_WEB_PORT", "8099"))
+
+COLOUR = {"text": "#4a7c59", "image": "#b5651d", "partial": "#c9a227",
+          "signed": "#5b6b8c", "protected": "#8c5b6b", "broken": "#8c3b3b",
+          "oversize": "#6b6b6b"}
+MEANING = {"text": "already searchable", "image": "no text - candidate",
+           "partial": "some text - candidate", "signed": "signed, never touched",
+           "protected": "password protected", "broken": "unreadable",
+           "oversize": "too large"}
+CANDIDATES = ("image", "partial")
+
+
+def conn():
+    return sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=5)
+
+
+def running():
+    """The argument line of a running coordinator, if there is one."""
+    try:
+        # The trailing space is what separates the coordinator from
+        # ocr-in-place-worker and ocr-in-place-web on the same machine.
+        out = subprocess.run(["pgrep", "-af", "ocr-in-place "], capture_output=True,
+                             text=True, timeout=5).stdout
+    except Exception:
+        return None
+    for line in out.splitlines():
+        if "-web" in line or "-worker" in line or "pgrep" in line:
+            continue
+        parts = line.split(None, 1)
+        if len(parts) == 2 and "ocr-in-place " in parts[1]:
+            tail = parts[1].split("ocr-in-place", 1)[1]
+            return tail.strip() or None
+    return None
+
+
+def target():
+    try:
+        with open(TARGET) as f:
+            t = f.read().split(None, 1)
+        return int(t[0]), (t[1].strip() if len(t) > 1 else "")
+    except Exception:
+        return 0, ""
+
+
+def rate(c, query, par=()):
+    """Throughput over the time that actually elapsed, not over a fixed window -
+    otherwise a freshly started run looks artificially slow."""
+    rows = list(c.execute(query, par))
+    if len(rows) < 2:
+        return 0.0
+    try:
+        t0 = dt.datetime.fromisoformat(min(r[0] for r in rows))
+        t1 = dt.datetime.fromisoformat(max(r[0] for r in rows))
+    except Exception:
+        return 0.0
+    minutes = (t1 - t0).total_seconds() / 60.0
+    if minutes < 0.2:
+        return 0.0
+    return sum(r[1] or 0 for r in rows) / minutes
+
+
+def bar(fraction, colour="#4a7c59"):
+    p = max(0.0, min(1.0, fraction)) * 100
+    return f'<div class="bar"><div style="width:{p:.1f}%;background:{colour}"></div></div>'
+
+
+CSS = """
+body{font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+margin:0;padding:24px;background:#f6f6f4;color:#222;max-width:1100px}
+h1{font-size:21px;margin:0 0 4px}
+h2{font-size:15px;margin:28px 0 8px;text-transform:uppercase;letter-spacing:.06em;color:#666}
+.sub{color:#666;margin-bottom:20px;font-size:13px}
+.box{background:#fff;border:1px solid #e2e2dd;border-radius:8px;padding:16px;margin-bottom:14px}
+.bar{background:#e8e8e3;border-radius:4px;height:10px;overflow:hidden;margin:8px 0}
+.bar>div{height:100%}
+.k{display:flex;flex-wrap:wrap;gap:10px}
+.tile{flex:1 1 150px;background:#fff;border:1px solid #e2e2dd;border-radius:8px;padding:12px}
+.tile b{font-size:24px;display:block;line-height:1.1}
+.tile span{font-size:12px;color:#666}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px}
+table{border-collapse:collapse;width:100%;font-size:13px;background:#fff}
+th,td{text-align:left;padding:5px 8px;border-bottom:1px solid #eee}
+th{color:#666;font-weight:600;font-size:12px}
+td.p{font-family:ui-monospace,Menlo,monospace;font-size:12px;word-break:break-all}
+.tag{padding:1px 7px;border-radius:10px;color:#fff;font-size:11px;white-space:nowrap}
+.ok{color:#4a7c59} .err{color:#8c3b3b}
+"""
+
+
+def page():
+    c = conn()
+    n_target, target_ref = target()
+    # Count only the current scope, or older runs mix into the numbers.
+    rest = target_ref.split("/", 1)[1] if "/" in target_ref else ""
+    rest = rest.split(" (")[0].strip().rstrip("/")
+    scope = (rest + "/%") if rest else "%"
+
+    st = list(c.execute(
+        "select status, count(*), coalesce(sum(pages),0), "
+        "coalesce(sum(pages-textpages),0) from items where path like ? "
+        "group by status order by 2 desc", (scope,)))
+    total = sum(r[1] for r in st)
+    since = (dt.datetime.now() - dt.timedelta(minutes=10)).isoformat(timespec="seconds")
+    scan_rate = rate(c, "select checked_at, 1 from (select checked_at from items "
+                        "where checked_at > ? and path like ? "
+                        "order by checked_at desc limit 200)", (since, scope))
+    last = c.execute("select max(checked_at) from items where path like ?",
+                     (scope,)).fetchone()[0] or "-"
+    cand = sum(r[1] for r in st if r[0] in CANDIDATES)
+    cand_pages = sum(r[3] for r in st if r[0] in CANDIDATES)
+
+    o = ['<!doctype html><html lang="en"><head><meta charset="utf-8">',
+         '<meta name="viewport" content="width=device-width,initial-scale=1">',
+         '<meta http-equiv="refresh" content="15">',
+         '<title>ocr-in-place</title><style>', CSS, '</style></head><body>',
+         "<h1>ocr-in-place &mdash; making PDFs searchable</h1>"]
+    live = running()
+    if live:
+        o.append(f'<div class="sub">running: <code>ocr-in-place '
+                 f'{html.escape(live)}</code> &middot; last {html.escape(str(last))}</div>')
+    else:
+        o.append(f'<div class="sub">no run active &middot; '
+                 f'last {html.escape(str(last))}</div>')
+
+    o.append('<div class="box">')
+    if n_target:
+        left = max(0, n_target - total)
+        eta = (f"{left / scan_rate / 60:.1f} h" if scan_rate > 0.05 and left
+               else ("done" if not left else "?"))
+        o.append(f"<b>{total}</b> of {n_target} examined "
+                 f"<span style='color:#666'>&middot; {html.escape(target_ref)}</span>")
+        o.append(bar(total / n_target))
+        o.append(f'<div class="sub" style="margin:0">{scan_rate:.1f} files/min '
+                 f'&middot; {left} to go &middot; about {eta} left</div>')
+    else:
+        o.append(f"<b>{total}</b> files examined &middot; {scan_rate:.1f}/min")
+    o.append("</div>")
+
+    o.append("<h2>Inventory &ndash; which files already carry text?</h2><div class='k'>")
+    for s, n, pages, without in st:
+        col = COLOUR.get(s, "#888")
+        o.append(f'<div class="tile"><b style="color:{col}">{n}</b>'
+                 f'<span><span class="dot" style="background:{col}"></span>{s} &ndash; '
+                 f'{MEANING.get(s, "")}<br>{pages} pages</span></div>')
+    o.append("</div>")
+    o.append(f'<div class="box">Candidates for OCR: <b>{cand}</b> file(s) with '
+             f'<b>{cand_pages}</b> page(s) that have no text layer.</div>')
+
+    done = c.execute("select count(distinct item_id) from ocr "
+                     "where result in ('ok','no-gain') and path like ?",
+                     (scope,)).fetchone()[0]
+    done_pages = c.execute("select coalesce(sum(pages),0) from ocr "
+                           "where result='ok' and path like ?", (scope,)).fetchone()[0]
+    page_rate = rate(c, "select at, pages from (select at, pages from ocr "
+                        "where result='ok' and at > ? and path like ? "
+                        "order by id desc limit 60)", (since, scope))
+    if cand:
+        left = max(0, cand - done)
+        left_pages = max(0, cand_pages - done_pages)
+        eta = (f"{left_pages / page_rate:.0f} min" if page_rate > 1 and left
+               else ("done" if not left else "?"))
+        o.append('<h2>OCR run</h2><div class="box">')
+        o.append(f"<b>{done}</b> of {cand} candidates finished "
+                 f"<span style='color:#666'>&middot; {done_pages} pages given a "
+                 f"text layer</span>")
+        o.append(bar(done / cand))
+        o.append(f'<div class="sub" style="margin:0">{page_rate:.0f} pages/min '
+                 f'&middot; {left} file(s) to go &middot; about {eta} left</div></div>')
+
+    names = sorted({r[0] for r in c.execute(
+        "select coalesce(worker,'?') from ocr where result='ok' and path like ? "
+        "group by 1", (scope,))} | {r[0] for r in c.execute(
+        "select worker from items where worker is not null group by 1")})
+    if names:
+        o.append("<h2>Workers</h2><div class='k'>")
+        for w in names:
+            n_files, n_pages, secs = c.execute(
+                "select count(*), coalesce(sum(pages),0), coalesce(sum(seconds),0) "
+                "from ocr where result='ok' and coalesce(worker,'?')=? and path like ?",
+                (w, scope)).fetchone()
+            ocr_now = rate(c, "select at, pages from (select at, pages from ocr "
+                              "where result='ok' and worker=? and at > ? and path like ? "
+                              "order by id desc limit 40)", (w, since, scope))
+            examined = c.execute("select count(*) from items where worker=? and path like ?",
+                                 (w, scope)).fetchone()[0]
+            scan_now = 0
+            # A run writes items rows too. Reporting those as an ongoing scan
+            # would be wrong - only show a live scan rate while scan is running.
+            if (live or "").strip().startswith("scan"):
+                scan_now = rate(c, "select checked_at, 1 from (select checked_at from items "
+                                   "where worker=? and checked_at > ? "
+                                   "order by checked_at desc limit 200)", (w, since))
+            busy = []
+            if ocr_now:
+                busy.append(f"OCR {ocr_now:.0f} pages/min")
+            if scan_now:
+                busy.append(f"scanning {scan_now:.0f} files/min")
+            o.append(f'<div class="tile"><b>{html.escape(w)}</b><span>'
+                     f'OCR: {n_pages} pages in {n_files} file(s)'
+                     + (f" &middot; {n_pages / secs:.1f} pages/s" if secs else "")
+                     + f'<br>inventory: {examined} file(s) examined<br>'
+                     + ("<b>now " + " &middot; ".join(busy) + "</b>" if busy
+                        else ("<b>busy</b>" if live else "idle"))
+                     + '</span></div>')
+        o.append("</div>")
+
+    results = list(c.execute("select result, count(*) from ocr where path like ? "
+                             "group by result order by 2 desc", (scope,)))
+    if results:
+        o.append("<h2>Results</h2><div class='k'>")
+        for r, n in results:
+            col = "#4a7c59" if r == "ok" else "#8c3b3b"
+            o.append(f'<div class="tile"><b style="color:{col}">{n}</b>'
+                     f'<span>{html.escape(r or "")}</span></div>')
+        o.append("</div><table><tr><th>when</th><th>file</th><th>pages</th>"
+                 "<th>pages with text<br>before &rarr; after</th>"
+                 "<th>size kB<br>before &rarr; after</th>"
+                 "<th>versions<br>before &rarr; after</th><th>where</th>"
+                 "<th>result</th></tr>")
+        for r in c.execute("select at,path,pages,textpages_before,textpages_after,"
+                           "size_before,size_after,versions_before,versions_after,"
+                           "result,note,coalesce(worker,'') from ocr where path like ? "
+                           "order by id desc limit 25", (scope,)):
+            cls = "ok" if r[9] == "ok" else "err"
+            size = f"{(r[5] or 0)//1024} &rarr; {(r[6] or 0)//1024}" if r[5] else "-"
+            vers = f"{r[7]} &rarr; {r[8]}" if r[7] is not None else "-"
+            text = f"{r[3]} &rarr; {r[4]}" if r[3] is not None else "-"
+            o.append(f"<tr><td>{html.escape(str(r[0] or ''))[:16]}</td>"
+                     f"<td class='p'>{html.escape(r[1] or '')}</td>"
+                     f"<td>{r[2] or ''}</td><td>{text}</td><td>{size}</td><td>{vers}</td>"
+                     f"<td>{html.escape(r[11])}</td>"
+                     f"<td class='{cls}'>{html.escape(r[9] or '')}"
+                     f"{' &middot; ' + html.escape((r[10] or '')[:80]) if r[10] else ''}"
+                     f"</td></tr>")
+        o.append("</table>")
+        o.append('<div class="sub" style="margin-top:6px">'
+                 '<b>ok</b> = text layer added and stored as a new version, the '
+                 'original stays as the previous one &middot; '
+                 '<b>no-gain</b> = nothing legible on the pages without a text layer '
+                 '(usually artwork inside an otherwise searchable document), file '
+                 'left untouched &middot; '
+                 '<b>verify-failed</b> = the check after OCR failed, nothing '
+                 'uploaded &middot; '
+                 '<b>ocr-error</b> / <b>upload-error</b> = aborted, file '
+                 'unchanged</div>')
+
+    o.append("<h2>Recently examined</h2><table><tr><th>status</th><th>pages</th>"
+             "<th>with text</th><th>file</th></tr>")
+    for s, pages, tpages, p, note in c.execute(
+            "select status,pages,textpages,path,note from items where path like ? "
+            "order by checked_at desc limit 25", (scope,)):
+        col = COLOUR.get(s, "#888")
+        o.append(f'<tr><td><span class="tag" style="background:{col}">{s}</span></td>'
+                 f'<td>{pages}</td><td>{tpages}</td><td class="p">'
+                 f'{html.escape(p or "")}'
+                 f'{" <i>" + html.escape(note) + "</i>" if note else ""}</td></tr>')
+    o.append("</table>")
+    o.append(f'<div class="sub" style="margin-top:22px">Refreshes every 15 s '
+             f'&middot; read-only from {html.escape(DB)}</div>')
+    o.append("</body></html>")
+    c.close()
+    return "\n".join(o)
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path.startswith("/health"):
+            body, kind = b"ok", "text/plain"
+        else:
+            try:
+                body, kind = page().encode(), "text/html; charset=utf-8"
+            except Exception as e:
+                body, kind = f"error: {e}".encode(), "text/plain; charset=utf-8"
+        self.send_response(200)
+        self.send_header("Content-Type", kind)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a):
+        pass
+
+
+if __name__ == "__main__":
+    ThreadingHTTPServer((BIND, PORT), Handler).serve_forever()

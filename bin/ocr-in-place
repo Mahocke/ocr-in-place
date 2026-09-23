@@ -1,0 +1,713 @@
+#!/usr/bin/env python3
+"""ocr-in-place - make scanned PDFs in SharePoint and OneDrive searchable.
+
+The file is downloaded, given an invisible text layer by ocrmypdf and written
+back onto its own item ID (/drives/<d>/items/<id>). Item ID, name, path,
+sharing links and metadata all stay as they were - SharePoint simply records a
+NEW VERSION. No new file is created, and the original remains recoverable as
+the previous version.
+
+Only this machine, the coordinator, holds the Graph credentials. The computing
+AND the file transfer happen on the workers: per file the coordinator hands out
+two pre-authorised URLs (downloadUrl, uploadUrl) that are valid for that one
+file and about an hour. The worker fetches straight from SharePoint, does the
+work and writes straight back. The document never passes through the
+coordinator, and no worker knows a secret.
+
+  --worker local:1:3        one job at a time here, ocrmypdf --jobs 3
+  --worker host-a:2:4       two jobs on host-a, 4 threads each  (= 8 threads)
+  --worker host-b:3:3       three jobs on host-b, 3 threads each (= 9 threads)
+
+Workers share one queue: whoever becomes free takes the next file. A slow or
+failed worker holds nothing up.
+
+Commands:
+  scan REF [-r]             read only: classify every PDF (text/partial/image/signed/...)
+  run  REF [-r] --yes       OCR the candidates and write them back as a new version
+  workers --worker ...      reachable? is ocrmypdf there? which version?
+  report [REF]              what has been scanned and processed so far
+  refresh REF [-r]          update stored cTags, metadata only
+
+Safety nets in run:
+  - digitally signed PDFs are never touched (OCR would break the signature)
+  - the cTag is compared immediately before the upload; changed elsewhere -> skipped
+  - verification: same page count, valid file, text actually present now
+  - version counter before/after; if it does not rise the whole run aborts
+    (a library without version history - there would be no way back)
+"""
+import argparse
+import csv
+import datetime as dt
+import fcntl
+import json
+import os
+import queue
+import re
+import sqlite3
+import subprocess
+import sys
+import threading
+
+_here = os.path.dirname(os.path.realpath(__file__))
+for _p in (os.path.join(_here, os.pardir, "lib"), "/usr/local/lib/ocr-in-place"):
+    if os.path.isfile(os.path.join(_p, "graph.py")):
+        sys.path.insert(0, _p)
+        break
+import graph as g  # noqa: E402
+
+STATE = os.environ.get("OCR_STATE", "/var/lib/ocr-in-place")
+CACHE = os.environ.get("OCR_CACHE", "/var/cache/ocr-in-place")
+RUN = os.environ.get("OCR_RUN", "/run/ocr-in-place")
+DB = os.path.join(STATE, "sharepoint.sqlite")
+WORK = CACHE
+LOCK = os.path.join(RUN, "ocr-in-place.lock")
+LOCAL_WORKER = os.path.join(_here, "ocr-in-place-worker")
+REMOTE_WORKER = os.environ.get("OCR_REMOTE_WORKER", "~/bin/ocr-in-place-worker")
+# Keep one connection per worker open. Without this every single file costs a
+# full ssh handshake - across a relayed VPN that is easily 800 ms.
+SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
+       "-o", "ServerAliveInterval=30",
+       "-o", "ControlMaster=auto", "-o", f"ControlPath={RUN}/ssh-%r@%h-%p",
+       "-o", "ControlPersist=600"]
+
+CANDIDATES = ("image", "partial")
+SELECT = ("id,name,size,folder,file,cTag,eTag,fileSystemInfo,"
+          "lastModifiedDateTime,webUrl,parentReference")
+WRITE = threading.Lock()
+_tls = threading.local()
+
+
+# ---------- storage ----------
+
+def connection():
+    if not hasattr(_tls, "c"):
+        os.makedirs(os.path.dirname(DB), exist_ok=True)
+        _tls.c = sqlite3.connect(DB, timeout=60, check_same_thread=False)
+    return _tls.c
+
+
+def db_init():
+    c = connection()
+    c.executescript("""
+    pragma journal_mode=wal;
+    create table if not exists items(
+      drive_id text, item_id text, path text, name text, size int,
+      ctag text, status text, pages int, textpages int, note text,
+      checked_at text, worker text, primary key(drive_id, item_id));
+    create table if not exists ocr(
+      id integer primary key autoincrement,
+      drive_id text, item_id text, path text, at text,
+      size_before int, size_after int, pages int,
+      textpages_before int, textpages_after int,
+      ctag_before text, ctag_after text,
+      versions_before int, versions_after int,
+      result text, note text, worker text, seconds real);
+    create index if not exists ocr_item on ocr(drive_id, item_id);
+    """)
+    c.commit()
+    return c
+
+
+def write(sql, values):
+    with WRITE:
+        c = connection()
+        c.execute(sql, values)
+        c.commit()
+
+
+def lock():
+    os.makedirs(os.path.dirname(LOCK), exist_ok=True)
+    fh = open(LOCK, "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        g.die("ocr-in-place is already running (lock " + LOCK + ")")
+    return fh
+
+
+def now():
+    return dt.datetime.now().isoformat(timespec="seconds")
+
+
+# ---------- walking the tree ----------
+
+def is_pdf(it):
+    return "file" in it and it["name"].lower().endswith(".pdf")
+
+
+def children(drive, path):
+    """$select has to include cTag/eTag/fileSystemInfo - without the cTag every
+    concurrent-change check fails."""
+    return list(g.pages(g.item_sub(drive["id"], path, "children"),
+                        params={"$select": SELECT}))
+
+
+def walk(drive, path, recursive, threads=6):
+    """One Graph call per folder, in parallel. Done sequentially, a few thousand
+    folders are the real bottleneck - not the OCR."""
+    todo = queue.Queue()
+    out = queue.Queue(maxsize=1000)
+    todo.put(path)
+    open_count = [1]
+    guard = threading.Lock()
+    done = threading.Event()
+
+    def worker():
+        while not done.is_set():
+            try:
+                p = todo.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                for it in children(drive, p):
+                    if "folder" in it:
+                        if recursive:
+                            with guard:
+                                open_count[0] += 1
+                            todo.put((p.rstrip("/") + "/" + it["name"]).lstrip("/"))
+                    elif is_pdf(it):
+                        out.put(it)
+            except Exception as e:
+                print(f"  ! {p or '/'}: {e}", file=sys.stderr)
+            finally:
+                with guard:
+                    open_count[0] -= 1
+                    if open_count[0] == 0:
+                        done.set()
+
+    for _ in range(max(1, threads)):
+        threading.Thread(target=worker, daemon=True).start()
+    while True:
+        try:
+            yield out.get(timeout=0.3)
+        except queue.Empty:
+            if done.is_set() and out.empty():
+                break
+
+
+def from_db(drive, path, allowed):
+    """Candidates from the last scan - no second walk of the tree. Yields
+    placeholders; the worker thread fetches fresh metadata."""
+    c = connection()
+    # Sort out what is already finished right here in SQL. Otherwise the run
+    # first fetches metadata for every one of tens of thousands of candidates
+    # and then discards them.
+    q = ("select item_id, path from items where drive_id=? and status in ("
+         + ",".join("?" * len(allowed)) + ") and not exists (select 1 from ocr o "
+         "where o.drive_id=items.drive_id and o.item_id=items.item_id "
+         "and o.result in ('ok','no-gain'))")
+    par = [drive["id"], *allowed]
+    p = path.strip("/")
+    if p:
+        q += " and (path=? or path like ?)"
+        par += [p, p + "/%"]
+    for item_id, pth in c.execute(q + " order by path", par).fetchall():
+        yield {"id": item_id, "name": pth.rsplit("/", 1)[-1], "_later": True}
+
+
+def version_count(drive_id, item_id):
+    try:
+        return len(g.get(f"/drives/{drive_id}/items/{item_id}/versions")
+                   .get("value", []))
+    except Exception:
+        return -1
+
+
+# ---------- workers ----------
+
+class Worker:
+    def __init__(self, spec):
+        parts = re.split(r"[:x]", spec.strip())
+        self.name = parts[0]
+        self.slots = int(parts[1]) if len(parts) > 1 else 1
+        self.jobs = int(parts[2]) if len(parts) > 2 else 3
+
+    def __str__(self):
+        return f"{self.name} ({self.slots}x{self.jobs} = {self.slots * self.jobs} threads)"
+
+
+class WorkerProcess:
+    """One long-lived process per slot. A job goes in as a JSON line, the result
+    comes out as a JSON line - a single ssh connection for the whole run instead
+    of one per file."""
+
+    def __init__(self, worker, nr):
+        self.w = worker
+        self.nr = nr
+        os.makedirs(WORK, exist_ok=True)
+        os.makedirs(RUN, exist_ok=True)   # ssh puts its control socket here
+        self.errfile = open(os.path.join(WORK, f"worker-{worker.name}-{nr}.err"), "a")
+        cmd = ([LOCAL_WORKER] if worker.name == "local"
+               else SSH + [worker.name, REMOTE_WORKER])
+        self.p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=self.errfile, text=True, bufsize=1)
+        self.lock = threading.Lock()
+
+    def submit(self, job, callback=None):
+        """Send a job. If the worker reports 'ready' on the way, callback()
+        decides and its answer goes back - that is how the worker only gets the
+        upload address once it is clear that an upload should happen."""
+        with self.lock:
+            if self.p.poll() is not None:
+                raise RuntimeError(f"worker {self.w.name} exited "
+                                   f"(code {self.p.returncode})")
+            self.p.stdin.write(json.dumps(job, ensure_ascii=False) + "\n")
+            self.p.stdin.flush()
+            while True:
+                line = self.p.stdout.readline()
+                if not line:
+                    raise RuntimeError(f"worker {self.w.name} stopped answering")
+                res = json.loads(line)
+                if res.get("phase") != "ready":
+                    return res
+                try:
+                    answer = callback(res) if callback else {"reason": "not expected"}
+                except Exception as e:
+                    answer = {"reason": str(e)[:200]}
+                self.p.stdin.write(json.dumps(answer, ensure_ascii=False) + "\n")
+                self.p.stdin.flush()
+
+    def close(self):
+        try:
+            self.p.stdin.close()
+            self.p.wait(timeout=15)
+        except Exception:
+            self.p.kill()
+        self.errfile.close()
+
+
+def start_slots(workers):
+    return [WorkerProcess(w, i) for w in workers for i in range(w.slots)]
+
+
+def cmd_workers(args):
+    for w in [Worker(x) for x in (args.worker or ["local:1:3"])]:
+        try:
+            wp = WorkerProcess(w, 0)
+            res = wp.submit({"id": "probe", "mode": "probe"})
+            wp.close()
+            print(f"OK   {str(w):<42} {res.get('ocrmypdf', '')}"
+                  + ("" if res.get("ok") else f"  ({res.get('error', '')[:60]})"))
+        except Exception as e:
+            print(f"FAIL {str(w):<42} {str(e)[:100]}")
+
+
+def pool(source, slots, work, state):
+    """work(idx, worker, item) in one thread per slot, fed from source."""
+    q = queue.Queue(maxsize=256)
+
+    def feed():
+        try:
+            for it in source:
+                if state["stop"].is_set():
+                    break
+                q.put(it)
+        finally:
+            for _ in slots:
+                q.put(None)
+
+    def loop(idx, w):
+        while True:
+            it = q.get()
+            try:
+                if it is None or state["stop"].is_set():
+                    return
+                work(idx, w, it)
+            except Exception as e:
+                with state["lock"]:
+                    state["errors"] += 1
+                print(f"ERROR        {it.get('name', '?')}: {e}", file=sys.stderr)
+            finally:
+                q.task_done()
+
+    t = threading.Thread(target=feed, daemon=True)
+    t.start()
+    threads = [threading.Thread(target=loop, args=(i, w)) for i, w in enumerate(slots)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    t.join(timeout=5)
+
+
+# ---------- scan ----------
+
+def cmd_scan(args):
+    drive, path = g.resolve(args.ref)
+    db_init()
+    os.makedirs(WORK, exist_ok=True)
+    state = {"lock": threading.Lock(), "stop": threading.Event(),
+             "n": 0, "errors": 0, "counts": {}, "rows": []}
+
+    def work(idx, w, it):
+        c = connection()
+        p = g.item_path(it)
+        ctag = it.get("cTag") or it.get("eTag") or ""
+        known = c.execute("select status, pages, textpages, note from items "
+                          "where drive_id=? and item_id=? and ctag=?",
+                          (drive["id"], it["id"], ctag)).fetchone()
+        if known and not args.rescan:
+            status, pages, textpages, note = known
+        elif it.get("size", 0) > args.max_mb * 1024 * 1024:
+            status, pages, textpages, note = "oversize", 0, 0, f">{args.max_mb} MB"
+        else:
+            try:
+                full = g.get(f"/drives/{drive['id']}/items/{it['id']}")
+                res = w.submit({"id": it["id"], "mode": "scan",
+                                "download": full["@microsoft.graph.downloadUrl"]})
+            except Exception as e:
+                res = {"ok": False, "transient": True, "error": str(e)[:200]}
+            # Being throttled is NOT a defect. Store nothing, or the OCR run
+            # would silently skip the file later on.
+            if not res.get("ok") and res.get("transient"):
+                with state["lock"]:
+                    state["errors"] += 1
+                print(f"throttled    {p}  [not stored, retried next run]",
+                      file=sys.stderr, flush=True)
+                return
+            if res.get("ok"):
+                status, pages = res["status"], res["pages"]
+                textpages, note = res["textpages"], res.get("note", "")
+            else:
+                status, pages, textpages = "broken", 0, 0
+                note = str(res.get("error"))[:120]
+            write("insert or replace into items(drive_id,item_id,path,name,size,ctag,"
+                  "status,pages,textpages,note,checked_at,worker) "
+                  "values(?,?,?,?,?,?,?,?,?,?,?,?)",
+                  (drive["id"], it["id"], p, it["name"], it.get("size", 0), ctag,
+                   status, pages, textpages, note, now(), w.w.name))
+        with state["lock"]:
+            state["n"] += 1
+            state["counts"][status] = state["counts"].get(status, 0) + 1
+            state["rows"].append((status, pages, textpages, it.get("size", 0), p, note))
+            n = state["n"]
+        if not args.quiet:
+            print(f"{n:>6} {status:10} {pages:>4}p {textpages:>4}t  {p}"
+                  + (f"   [{note}]" if note else ""), flush=True)
+
+    workers = [Worker(x) for x in (args.worker or [f"local:{max(1, args.parallel)}:1"])]
+    slots = start_slots(workers)
+    print("workers: " + ", ".join(str(x) for x in workers))
+    try:
+        pool(walk(drive, path, args.recursive, args.walk), slots, work, state)
+    finally:
+        for s in slots:
+            s.close()
+
+    counts, rows = state["counts"], state["rows"]
+    print(f"\n{state['n']} PDF(s) under {args.ref}")
+    for s in sorted(counts, key=lambda k: -counts[k]):
+        print(f"  {s:10} {counts[s]:>5}")
+    cand = sum(counts.get(s, 0) for s in CANDIDATES)
+    cand_pages = sum(r[1] - r[2] for r in rows if r[0] in CANDIDATES)
+    print(f"\ncandidates for OCR: {cand} file(s), {cand_pages} page(s) without text")
+    if args.csv:
+        with open(args.csv, "w", newline="") as f:
+            wr = csv.writer(f)
+            wr.writerow(["status", "pages", "textpages", "bytes", "path", "note"])
+            wr.writerows(rows)
+        print(f"CSV: {args.csv}")
+
+
+# ---------- run ----------
+
+def cmd_run(args):
+    if not args.yes and not args.dry_run:
+        g.die("run writes new versions - confirm with --yes (or use --dry-run)")
+    lock()
+    drive, path = g.resolve(args.ref)
+    db_init()
+    os.makedirs(WORK, exist_ok=True)
+    workers = [Worker(x) for x in (args.worker or ["local:1:3"])]
+    slots = start_slots(workers)
+    print("workers: " + ", ".join(str(x) for x in workers)
+          + f"  ->  {len(slots)} job(s) at a time")
+    allowed = ("image",) if args.only_image else CANDIDATES
+    state = {"lock": threading.Lock(), "stop": threading.Event(),
+             "done": 0, "errors": 0, "skipped": 0, "vchecks": 0}
+
+    def work(idx, w, it):
+        c = connection()
+        if it.get("_later") or not it.get("@microsoft.graph.downloadUrl"):
+            it = g.get(f"/drives/{drive['id']}/items/{it['id']}")
+        p = g.item_path(it)
+        ctag = it.get("cTag") or it.get("eTag") or ""
+        if it.get("size", 0) > args.max_mb * 1024 * 1024:
+            with state["lock"]:
+                state["skipped"] += 1
+            print(f"skipped      {p}  [>{args.max_mb} MB]", flush=True)
+            return
+        # ctag_after is checked too: after our own upload the file carries a new
+        # cTag. Without this a second pass would process everything again.
+        if c.execute("select 1 from ocr where drive_id=? and item_id=? "
+                     "and result in ('ok','no-gain') and (ctag_before=? or ctag_after=?)",
+                     (drive["id"], it["id"], ctag, ctag)).fetchone():
+            return
+        known = c.execute("select status from items where drive_id=? and item_id=? "
+                          "and ctag=?", (drive["id"], it["id"], ctag)).fetchone()
+        if known and known[0] not in allowed:
+            return
+        with state["lock"]:
+            if args.limit and state["done"] >= args.limit:
+                state["stop"].set()
+                return
+
+        old_mtime = (it.get("fileSystemInfo") or {}).get("lastModifiedDateTime")
+
+        def ready(_):
+            """The worker has finished computing and asks for the upload address."""
+            current = g.get(f"/drives/{drive['id']}/items/{it['id']}")
+            if (current.get("cTag") or current.get("eTag") or "") != ctag:
+                return {"reason": "changed in the meantime"}
+            props = {"@microsoft.graph.conflictBehavior": "replace"}
+            # The timestamp has to travel WITH the upload. Patching it
+            # afterwards would create a second version.
+            if args.keep_mtime and old_mtime:
+                props["fileSystemInfo"] = {"lastModifiedDateTime": old_mtime}
+            sess = g.post(f"/drives/{drive['id']}/items/{it['id']}/createUploadSession",
+                          json_body={"item": props})
+            return {"upload": sess["uploadUrl"]}
+
+        # The version counter is a property of the library, not of the file. The
+        # first few files establish it; after that it is just expensive calls.
+        with state["lock"]:
+            check_v = state["vchecks"] < args.versions
+            if check_v:
+                state["vchecks"] += 1
+        v_before = version_count(drive["id"], it["id"]) if check_v else -1
+
+        res = w.submit({"id": it["id"], "mode": "ocr",
+                        "download": it["@microsoft.graph.downloadUrl"],
+                        "twophase": not args.dry_run, "lang": args.lang,
+                        "jobs": w.w.jobs, "nice": args.nice, "timeout": args.timeout,
+                        "pdfa": args.pdfa}, ready)
+
+        status = res.get("status", "broken")
+        if res.get("ok"):
+            write("insert or replace into items(drive_id,item_id,path,name,size,ctag,"
+                  "status,pages,textpages,note,checked_at,worker) "
+                  "values(?,?,?,?,?,?,?,?,?,?,?,?)",
+                  (drive["id"], it["id"], p, it["name"], it.get("size", 0), ctag,
+                   status, res.get("pages", 0), res.get("textpages", 0),
+                   res.get("note", ""), now(), w.w.name))
+
+        if not res.get("ok") and res.get("transient"):
+            with state["lock"]:
+                state["skipped"] += 1
+            print(f"throttled    {p}  [retried next run]", file=sys.stderr, flush=True)
+            return
+        if not res.get("ok"):
+            with state["lock"]:
+                state["errors"] += 1
+            reason = str(res.get("error", "unknown"))
+            print(f"ERROR        {p}  [{w.w.name}: {reason}]", file=sys.stderr, flush=True)
+            write("insert into ocr(drive_id,item_id,path,at,ctag_before,result,note,worker) "
+                  "values(?,?,?,?,?,?,?,?)",
+                  (drive["id"], it["id"], p, now(), ctag,
+                   "verify-failed" if reason.startswith("verify") else "ocr-error",
+                   reason[:300], w.w.name))
+            return
+
+        if status not in allowed:
+            if status in ("signed", "protected", "broken"):
+                with state["lock"]:
+                    state["skipped"] += 1
+                print(f"untouched    {p}  [{status}"
+                      + (f": {res.get('note')}" if res.get("note") else "") + "]",
+                      flush=True)
+            return
+
+        pages = res.get("pages", 0)
+        before, after = res.get("textpages", 0), res.get("textpages_after", 0)
+        sz_b, sz_a = res.get("size_before", 0), res.get("size_after", 0)
+        secs = res.get("seconds", 0)
+
+        if res.get("result") == "aborted":
+            with state["lock"]:
+                state["skipped"] += 1
+            print(f"skipped      {p}  [{res.get('note', '')}]", flush=True)
+            return
+
+        if res.get("result") == "no-gain":
+            # The common case: a document that has text almost everywhere, and
+            # the remaining pages are artwork with nothing legible on them.
+            # Nothing to win, so no new version either - that is not a failure.
+            note = (f"{before} of {pages} pages already had text, "
+                    f"nothing legible on the rest")
+            print(f"no gain      {p}  [{note}]", flush=True)
+            write("insert into ocr(drive_id,item_id,path,at,pages,textpages_before,"
+                  "ctag_before,result,note,worker,seconds) values(?,?,?,?,?,?,?,?,?,?,?)",
+                  (drive["id"], it["id"], p, now(), pages, before, ctag, "no-gain",
+                   note, w.w.name, secs))
+            return
+
+        if args.dry_run:
+            with state["lock"]:
+                state["done"] += 1
+            print(f"would OCR    {p}  {pages}p  {before}->{after} text pages  "
+                  f"{sz_b // 1024} -> {sz_a // 1024} kB  ({w.w.name}, {secs:.0f}s)",
+                  flush=True)
+            return
+
+        if not res.get("uploaded"):
+            with state["lock"]:
+                state["errors"] += 1
+            print(f"ERROR        {p}  [not uploaded]", file=sys.stderr, flush=True)
+            return
+
+        v_after = version_count(drive["id"], it["id"]) if check_v else -1
+        write("insert into ocr(drive_id,item_id,path,at,size_before,size_after,pages,"
+              "textpages_before,textpages_after,ctag_before,ctag_after,"
+              "versions_before,versions_after,result,note,worker,seconds) "
+              "values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+              (drive["id"], it["id"], p, now(), sz_b, sz_a, pages, before, after,
+               ctag, res.get("ctag", ""), v_before, v_after, "ok", "", w.w.name, secs))
+        # Bring the inventory row up to the state AFTER the upload. Otherwise
+        # the next scan considers every file we touched to have changed and
+        # downloads it again - a delta run would turn into a full run.
+        new_ctag = res.get("ctag", "")
+        if new_ctag:
+            write("update items set ctag=?, status=?, textpages=?, checked_at=? "
+                  "where drive_id=? and item_id=?",
+                  (new_ctag, "text" if after >= pages else "partial", after,
+                   now(), drive["id"], it["id"]))
+        with state["lock"]:
+            state["done"] += 1
+        vtext = f"v{v_before}->{v_after}  " if check_v else ""
+        fixed = ("  [via PDF/A, damaged JPEG repaired]"
+                 if res.get("output") == "pdfa" and not args.pdfa else "")
+        print(f"OK           {p}  {pages}p  {before}->{after} text pages  "
+              f"{sz_b // 1024} -> {sz_a // 1024} kB  {vtext}({w.w.name}, {secs:.0f}s){fixed}",
+              flush=True)
+        if check_v and v_before >= 0 and v_after <= v_before:
+            state["stop"].set()
+            print("\nABORTING: the version count did not rise. This library does not "
+                  "appear to keep a version history, so the original could not be "
+                  "restored.", file=sys.stderr, flush=True)
+
+    source = (walk(drive, path, args.recursive, args.walk) if args.rewalk
+              else from_db(drive, path, allowed))
+    if not args.rewalk:
+        print("candidates from the last scan (--rewalk walks the tree again)")
+    try:
+        pool(source, slots, work, state)
+    finally:
+        for s in slots:
+            s.close()
+    print(f"\nfinished: {state['done']} processed, {state['skipped']} skipped, "
+          f"{state['errors']} error(s)")
+    if state["done"] and not args.dry_run:
+        print("In SharePoint the previous version of each file is the original.")
+
+
+# ---------- report / refresh ----------
+
+def cmd_report(args):
+    c = db_init()
+    where, par = "", []
+    if args.ref:
+        where, par = " where path like ?", [args.ref.split("/", 1)[-1].rstrip("/") + "%"]
+    print("classification:")
+    for s, n, pages in c.execute("select status, count(*), sum(pages) from items"
+                                 + where + " group by status order by 2 desc", par):
+        print(f"  {s:10} {n:>6} file(s) {pages or 0:>8} page(s)")
+    print("\nOCR results:")
+    for r, n in c.execute("select result, count(*) from ocr" + where
+                          + " group by result order by 2 desc", par):
+        print(f"  {r:14} {n:>6}")
+    print("\nby worker:")
+    for w, n, secs, pages in c.execute(
+            "select coalesce(worker,'?'), count(*), coalesce(sum(seconds),0), "
+            "coalesce(sum(pages),0) from ocr" + where + " group by 1 order by 2 desc", par):
+        rate = f"{pages / secs * 60:.0f} pages/min" if secs else "-"
+        print(f"  {w:12} {n:>6} file(s) {pages:>7} page(s)  {rate}")
+    for r in c.execute("select at, path, result, note from ocr" + where
+                       + " order by id desc limit ?", par + [args.limit]):
+        print(f"  {r[0]}  {r[2]:<13} {r[1]}" + (f"  [{r[3]}]" if r[3] else ""))
+
+
+def cmd_refresh(args):
+    """Metadata only: bring stored cTags up to date, download nothing."""
+    drive, path = g.resolve(args.ref)
+    db_init()
+    n = changed = 0
+    for it in walk(drive, path, args.recursive, 6):
+        n += 1
+        ctag = it.get("cTag") or it.get("eTag") or ""
+        with WRITE:
+            c = connection()
+            cur = c.execute("update items set ctag=? where drive_id=? and item_id=? "
+                            "and ctag<>?", (ctag, drive["id"], it["id"], ctag))
+            c.commit()
+            changed += cur.rowcount
+    print(f"{n} PDF(s) checked, {changed} cTag(s) updated")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="ocr-in-place", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("scan", help="classify PDFs (read only)")
+    p.add_argument("ref")
+    p.add_argument("-r", "--recursive", action="store_true")
+    p.add_argument("--csv")
+    p.add_argument("--parallel", type=int, default=6,
+                   help="concurrent downloads when no --worker is given")
+    p.add_argument("--walk", type=int, default=6, help="threads walking the folder tree")
+    p.add_argument("--worker", action="append", metavar="NAME:SLOTS:JOBS")
+    p.add_argument("--max-mb", type=int, default=300)
+    p.add_argument("--rescan", action="store_true", help="re-examine already scanned files")
+    p.add_argument("--quiet", action="store_true", help="summary only")
+    p.set_defaults(fn=cmd_scan)
+
+    p = sub.add_parser("run", help="OCR and write back as a new version")
+    p.add_argument("ref")
+    p.add_argument("-r", "--recursive", action="store_true")
+    p.add_argument("--worker", action="append", metavar="NAME:SLOTS:JOBS",
+                   help="e.g. local:1:3, host-a:2:4 (may be given several times)")
+    p.add_argument("--yes", action="store_true", help="confirm writing")
+    p.add_argument("--dry-run", action="store_true", help="everything except the upload")
+    p.add_argument("--limit", type=int, default=0)
+    p.add_argument("--only-image", dest="only_image", action="store_true",
+                   help="skip partially-texted files, do pure scans only")
+    p.add_argument("--rewalk", action="store_true",
+                   help="walk the folder tree again instead of using the scan results")
+    p.add_argument("--walk", type=int, default=6, help="threads walking the folder tree")
+    p.add_argument("--lang", default="eng", help="tesseract languages, e.g. deu+eng")
+    p.add_argument("--nice", type=int, default=10)
+    p.add_argument("--versions", type=int, default=5,
+                   help="check the version counter for this many files (0 = never)")
+    p.add_argument("--timeout", type=int, default=3600)
+    p.add_argument("--max-mb", type=int, default=300)
+    p.add_argument("--pdfa", action="store_true", help="write PDF/A output")
+    p.add_argument("--no-keep-mtime", dest="keep_mtime", action="store_false",
+                   help="do NOT restore the original 'Modified' date")
+    p.set_defaults(fn=cmd_run, keep_mtime=True)
+
+    p = sub.add_parser("workers", help="check the workers")
+    p.add_argument("--worker", action="append")
+    p.set_defaults(fn=cmd_workers)
+
+    p = sub.add_parser("report", help="state from the database")
+    p.add_argument("ref", nargs="?")
+    p.add_argument("--limit", type=int, default=20)
+    p.set_defaults(fn=cmd_report)
+
+    p = sub.add_parser("refresh", help="update stored cTags (metadata only)")
+    p.add_argument("ref")
+    p.add_argument("-r", "--recursive", action="store_true")
+    p.set_defaults(fn=cmd_refresh)
+
+    args = ap.parse_args()
+    try:
+        args.fn(args)
+    except g.GraphError as e:
+        g.die(str(e))
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()
