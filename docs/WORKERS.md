@@ -41,8 +41,9 @@ mkdir -p ~/bin
 ocr-in-place workers --worker local:1:3 --worker host-a:2:4
 ```
 
-That prints the ocrmypdf version each machine reports, which is the quickest
-way to find the one that is three releases behind.
+That prints the full toolchain each machine reports - ocrmypdf, tesseract,
+Ghostscript, qpdf, poppler and the platform - and warns when the workers do not
+agree, which is the quickest way to find the one that is three releases behind.
 
 Set `OCR_REMOTE_WORKER` if you keep it somewhere other than
 `~/bin/ocr-in-place-worker`.

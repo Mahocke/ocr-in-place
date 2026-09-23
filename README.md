@@ -90,6 +90,7 @@ sudo install -m 644 lib/graph.py /usr/local/lib/ocr-in-place/
 | `workers --worker ...` | reachable? is ocrmypdf there? which version? |
 | `report [REF]` | what has been scanned and processed so far |
 | `refresh REF [-r]` | update stored cTags, metadata only |
+| `audit [REF] [--all]` | re-check finished files against their previous version |
 
 `REF` is a site, a library, a path, a user's OneDrive, a drive ID or the URL
 from your browser's address bar — see
@@ -115,6 +116,41 @@ below exists because that deserves respect:
 
 Do a `--dry-run` on a folder first. Look at the version history of the first
 file afterwards. Then let it loose.
+
+### Checking afterwards
+
+The tests protect future runs. `audit` protects the past: it takes files the
+journal calls finished, fetches the current version **and the one before it**,
+and verifies that what was claimed actually happened.
+
+```bash
+ocr-in-place audit --sample 50          # a random sample
+ocr-in-place audit --all contoso        # everything under one site
+```
+
+It reports a file whose page count changed, whose text is not actually there,
+or - the one that matters most - whose version history has quietly gone, so
+the original could no longer be restored. Exit code 1 if anything is wrong.
+This reads PDFs on the coordinator, so poppler-utils has to be installed there.
+
+### Reproducibility
+
+Every processed file records the **whole toolchain** that produced it, not just
+ocrmypdf: tesseract, Ghostscript, qpdf, poppler and the platform, stored once
+per distinct set and referenced by a short hash.
+
+```
+$ ocr-in-place workers --worker local:1:2 --worker host-a:4:2
+OK   local (1x2)   ocrmypdf=16.7.0  tesseract=5.5.0  ghostscript=10.05.1  qpdf=12.2.0 ...
+OK   host-a (4x2)  ocrmypdf=17.12.1 tesseract=5.5.3  ghostscript=10.08.0  qpdf=12.4.1 ...
+
+WARNING: the workers do not agree on their tool versions. The outcome for a
+damaged file then depends on which machine happens to pick it up.
+```
+
+That warning is not theoretical: qpdf 12 rejects damaged JPEG data that qpdf 11
+passed through, and the two machines above genuinely disagree about a handful
+of old scans.
 
 ## Spreading the work
 
@@ -169,6 +205,21 @@ There is also a delta-run timer in `systemd/` and two example runner scripts in
 - It does not deduplicate, rename, sort or otherwise tidy your archive.
 - It cannot do anything about a library that has version history turned off,
   except refuse to run.
+
+## Tests
+
+```bash
+tests/run-tests.sh
+```
+
+Thirty-three tests against a generated corpus of deliberately awkward PDFs -
+damaged JPEG, broken xref, truncated, encrypted, zero pages, signed - and a
+fake Graph server for the three situations you cannot rehearse against a live
+tenant: a file edited while OCR is running, a library with no version history,
+and a service that is rate limiting.
+
+The tests assert safety invariants rather than success. See
+[tests/README.md](tests/README.md).
 
 ## Requirements
 

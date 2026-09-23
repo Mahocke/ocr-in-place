@@ -27,6 +27,7 @@ Commands:
   workers --worker ...      reachable? is ocrmypdf there? which version?
   report [REF]              what has been scanned and processed so far
   refresh REF [-r]          update stored cTags, metadata only
+  audit [REF]               re-check finished files against their previous version
 
 Safety nets in run:
   - digitally signed PDFs are never touched (OCR would break the signature)
@@ -43,6 +44,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -57,20 +59,22 @@ import graph as g  # noqa: E402
 
 STATE = os.environ.get("OCR_STATE", "/var/lib/ocr-in-place")
 CACHE = os.environ.get("OCR_CACHE", "/var/cache/ocr-in-place")
-RUN = os.environ.get("OCR_RUN", "/run/ocr-in-place")
 DB = os.path.join(STATE, "sharepoint.sqlite")
 WORK = CACHE
-LOCK = os.path.join(RUN, "ocr-in-place.lock")
+LOCK = os.path.join(STATE, "run.lock")
 LOCAL_WORKER = os.path.join(_here, "ocr-in-place-worker")
 REMOTE_WORKER = os.environ.get("OCR_REMOTE_WORKER", "~/bin/ocr-in-place-worker")
 # Keep one connection per worker open. Without this every single file costs a
 # full ssh handshake - across a relayed VPN that is easily 800 ms.
 SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
        "-o", "ServerAliveInterval=30",
-       "-o", "ControlMaster=auto", "-o", f"ControlPath={RUN}/ssh-%r@%h-%p",
+       "-o", "ControlMaster=auto", "-o", f"ControlPath={WORK}/ssh-%r@%h-%p",
        "-o", "ControlPersist=600"]
 
 CANDIDATES = ("image", "partial")
+# Must match the worker: a page counts as carrying text from this many
+# non-whitespace characters. Used by audit, which reads PDFs here.
+MIN_CHARS = 50
 SELECT = ("id,name,size,folder,file,cTag,eTag,fileSystemInfo,"
           "lastModifiedDateTime,webUrl,parentReference")
 WRITE = threading.Lock()
@@ -101,8 +105,14 @@ def db_init():
       textpages_before int, textpages_after int,
       ctag_before text, ctag_after text,
       versions_before int, versions_after int,
-      result text, note text, worker text, seconds real);
+      result text, note text, worker text, seconds real, toolchain text);
     create index if not exists ocr_item on ocr(drive_id, item_id);
+    -- Which versions produced a given file. Stored once per distinct set and
+    -- referenced by a short hash: "ocrmypdf 16.7" alone does not reproduce a
+    -- result when qpdf and Ghostscript decide what survives a damaged scan.
+    create table if not exists toolchains(
+      id text primary key, ocrmypdf text, tesseract text, ghostscript text,
+      qpdf text, poppler text, platform text, first_seen text);
     """)
     c.commit()
     return c
@@ -113,6 +123,24 @@ def write(sql, values):
         c = connection()
         c.execute(sql, values)
         c.commit()
+
+
+def remember(tc):
+    """Record a toolchain and return its id.
+
+    Deliberately without an in-process cache: "insert or ignore" costs
+    nothing next to a page of OCR, and a cache would be one more piece of
+    state that can disagree with the database."""
+    if not tc:
+        return None
+    tid = tc.get("id")
+    if not tid:
+        return None
+    write("insert or ignore into toolchains(id,ocrmypdf,tesseract,ghostscript,"
+          "qpdf,poppler,platform,first_seen) values(?,?,?,?,?,?,?,?)",
+          (tid, tc.get("ocrmypdf"), tc.get("tesseract"), tc.get("ghostscript"),
+           tc.get("qpdf"), tc.get("poppler"), tc.get("platform"), now()))
+    return tid
 
 
 def lock():
@@ -142,9 +170,13 @@ def children(drive, path):
                         params={"$select": SELECT}))
 
 
-def walk(drive, path, recursive, threads=6):
+def walk(drive, path, recursive, threads=6, problems=None):
     """One Graph call per folder, in parallel. Done sequentially, a few thousand
-    folders are the real bottleneck - not the OCR."""
+    folders are the real bottleneck - not the OCR.
+
+    A folder that cannot be listed is appended to `problems`. Callers report
+    that in the summary: silently examining 67,000 of 68,000 files because one
+    listing was throttled is exactly the kind of gap nobody notices."""
     todo = queue.Queue()
     out = queue.Queue(maxsize=1000)
     todo.put(path)
@@ -168,6 +200,9 @@ def walk(drive, path, recursive, threads=6):
                     elif is_pdf(it):
                         out.put(it)
             except Exception as e:
+                if problems is not None:
+                    with guard:
+                        problems.append((p, str(e)[:200]))
                 print(f"  ! {p or '/'}: {e}", file=sys.stderr)
             finally:
                 with guard:
@@ -183,6 +218,18 @@ def walk(drive, path, recursive, threads=6):
         except queue.Empty:
             if done.is_set() and out.empty():
                 break
+
+
+def report_problems(problems):
+    """Say out loud which folders were never looked at."""
+    if not problems:
+        return
+    print(f"\nWARNING: {len(problems)} folder(s) could not be listed. The files "
+          f"in them were NOT examined and will be missing from every count above.")
+    for p, e in problems[:10]:
+        print(f"  ! {p or '/'}: {e}")
+    if len(problems) > 10:
+        print(f"  ... and {len(problems) - 10} more")
 
 
 def from_db(drive, path, allowed):
@@ -234,8 +281,7 @@ class WorkerProcess:
     def __init__(self, worker, nr):
         self.w = worker
         self.nr = nr
-        os.makedirs(WORK, exist_ok=True)
-        os.makedirs(RUN, exist_ok=True)   # ssh puts its control socket here
+        os.makedirs(WORK, exist_ok=True)   # ssh keeps its control socket here too
         self.errfile = open(os.path.join(WORK, f"worker-{worker.name}-{nr}.err"), "a")
         cmd = ([LOCAL_WORKER] if worker.name == "local"
                else SSH + [worker.name, REMOTE_WORKER])
@@ -280,16 +326,31 @@ def start_slots(workers):
     return [WorkerProcess(w, i) for w in workers for i in range(w.slots)]
 
 
+TOOLS_SHOWN = ("ocrmypdf", "tesseract", "ghostscript", "qpdf", "poppler", "platform")
+
+
 def cmd_workers(args):
+    seen = {}
     for w in [Worker(x) for x in (args.worker or ["local:1:3"])]:
         try:
             wp = WorkerProcess(w, 0)
             res = wp.submit({"id": "probe", "mode": "probe"})
             wp.close()
-            print(f"OK   {str(w):<42} {res.get('ocrmypdf', '')}"
-                  + ("" if res.get("ok") else f"  ({res.get('error', '')[:60]})"))
+            tc = res.get("toolchain") or {}
+            seen[w.name] = tc
+            print(f"{'OK  ' if res.get('ok') else 'WARN'} {str(w):<40} "
+                  + "  ".join(f"{k}={tc.get(k, '?')}" for k in TOOLS_SHOWN)
+                  + (f"  ({res.get('error', '')[:60]})" if not res.get("ok") else ""))
         except Exception as e:
-            print(f"FAIL {str(w):<42} {str(e)[:100]}")
+            print(f"FAIL {str(w):<40} {str(e)[:100]}")
+    ids = {n: tc.get("id") for n, tc in seen.items() if tc}
+    if len(set(ids.values())) > 1:
+        print("\nWARNING: the workers do not agree on their tool versions. The "
+              "outcome for a damaged file then depends on which machine happens "
+              "to pick it up. For a nightly delta run, use a single worker.")
+        for name, tc in seen.items():
+            print(f"  {name:<14} {tc.get('id', '?')}  "
+                  + " ".join(f"{k}={tc.get(k, '?')}" for k in TOOLS_SHOWN[:5]))
 
 
 def pool(source, slots, work, state):
@@ -338,6 +399,7 @@ def cmd_scan(args):
     os.makedirs(WORK, exist_ok=True)
     state = {"lock": threading.Lock(), "stop": threading.Event(),
              "n": 0, "errors": 0, "counts": {}, "rows": []}
+    problems = []
 
     def work(idx, w, it):
         c = connection()
@@ -389,7 +451,8 @@ def cmd_scan(args):
     slots = start_slots(workers)
     print("workers: " + ", ".join(str(x) for x in workers))
     try:
-        pool(walk(drive, path, args.recursive, args.walk), slots, work, state)
+        pool(walk(drive, path, args.recursive, args.walk, problems),
+             slots, work, state)
     finally:
         for s in slots:
             s.close()
@@ -401,6 +464,7 @@ def cmd_scan(args):
     cand = sum(counts.get(s, 0) for s in CANDIDATES)
     cand_pages = sum(r[1] - r[2] for r in rows if r[0] in CANDIDATES)
     print(f"\ncandidates for OCR: {cand} file(s), {cand_pages} page(s) without text")
+    report_problems(problems)
     if args.csv:
         with open(args.csv, "w", newline="") as f:
             wr = csv.writer(f)
@@ -501,11 +565,11 @@ def cmd_run(args):
                 state["errors"] += 1
             reason = str(res.get("error", "unknown"))
             print(f"ERROR        {p}  [{w.w.name}: {reason}]", file=sys.stderr, flush=True)
-            write("insert into ocr(drive_id,item_id,path,at,ctag_before,result,note,worker) "
-                  "values(?,?,?,?,?,?,?,?)",
+            write("insert into ocr(drive_id,item_id,path,at,ctag_before,result,note,"
+                  "worker,toolchain) values(?,?,?,?,?,?,?,?,?)",
                   (drive["id"], it["id"], p, now(), ctag,
                    "verify-failed" if reason.startswith("verify") else "ocr-error",
-                   reason[:300], w.w.name))
+                   reason[:300], w.w.name, remember(res.get("toolchain"))))
             return
 
         if status not in allowed:
@@ -536,9 +600,10 @@ def cmd_run(args):
                     f"nothing legible on the rest")
             print(f"no gain      {p}  [{note}]", flush=True)
             write("insert into ocr(drive_id,item_id,path,at,pages,textpages_before,"
-                  "ctag_before,result,note,worker,seconds) values(?,?,?,?,?,?,?,?,?,?,?)",
+                  "ctag_before,result,note,worker,seconds,toolchain) "
+                  "values(?,?,?,?,?,?,?,?,?,?,?,?)",
                   (drive["id"], it["id"], p, now(), pages, before, ctag, "no-gain",
-                   note, w.w.name, secs))
+                   note, w.w.name, secs, remember(res.get("toolchain"))))
             return
 
         if args.dry_run:
@@ -558,10 +623,11 @@ def cmd_run(args):
         v_after = version_count(drive["id"], it["id"]) if check_v else -1
         write("insert into ocr(drive_id,item_id,path,at,size_before,size_after,pages,"
               "textpages_before,textpages_after,ctag_before,ctag_after,"
-              "versions_before,versions_after,result,note,worker,seconds) "
-              "values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+              "versions_before,versions_after,result,note,worker,seconds,toolchain) "
+              "values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
               (drive["id"], it["id"], p, now(), sz_b, sz_a, pages, before, after,
-               ctag, res.get("ctag", ""), v_before, v_after, "ok", "", w.w.name, secs))
+               ctag, res.get("ctag", ""), v_before, v_after, "ok", "", w.w.name, secs,
+               remember(res.get("toolchain"))))
         # Bring the inventory row up to the state AFTER the upload. Otherwise
         # the next scan considers every file we touched to have changed and
         # downloads it again - a delta run would turn into a full run.
@@ -585,7 +651,8 @@ def cmd_run(args):
                   "appear to keep a version history, so the original could not be "
                   "restored.", file=sys.stderr, flush=True)
 
-    source = (walk(drive, path, args.recursive, args.walk) if args.rewalk
+    problems = []
+    source = (walk(drive, path, args.recursive, args.walk, problems) if args.rewalk
               else from_db(drive, path, allowed))
     if not args.rewalk:
         print("candidates from the last scan (--rewalk walks the tree again)")
@@ -596,6 +663,7 @@ def cmd_run(args):
             s.close()
     print(f"\nfinished: {state['done']} processed, {state['skipped']} skipped, "
           f"{state['errors']} error(s)")
+    report_problems(problems)
     if state["done"] and not args.dry_run:
         print("In SharePoint the previous version of each file is the original.")
 
@@ -621,9 +689,120 @@ def cmd_report(args):
             "coalesce(sum(pages),0) from ocr" + where + " group by 1 order by 2 desc", par):
         rate = f"{pages / secs * 60:.0f} pages/min" if secs else "-"
         print(f"  {w:12} {n:>6} file(s) {pages:>7} page(s)  {rate}")
+    rows = list(c.execute(
+        "select t.id, t.ocrmypdf, t.qpdf, t.ghostscript, t.platform, count(o.id) "
+        "from toolchains t left join ocr o on o.toolchain=t.id group by t.id "
+        "order by 6 desc"))
+    if rows:
+        print("\ntoolchains that produced these files:")
+        for tid, omp, qpdf, gs, plat, n in rows:
+            print(f"  {tid}  {n:>6} file(s)  ocrmypdf={omp} qpdf={qpdf} "
+                  f"ghostscript={gs}  {plat}")
     for r in c.execute("select at, path, result, note from ocr" + where
                        + " order by id desc limit ?", par + [args.limit]):
         print(f"  {r[0]}  {r[2]:<13} {r[1]}" + (f"  [{r[3]}]" if r[3] else ""))
+
+
+# ---------- audit ----------
+#
+# The tests protect future runs. This protects the past: it takes files the
+# journal calls finished, fetches the current version AND the one before it,
+# and checks that what we claimed actually happened - the page count held, the
+# text is really there, and the original is still sitting in the history where
+# somebody could restore it.
+#
+# Unlike the rest of the program this reads PDFs on the coordinator itself, so
+# pdfinfo and pdftotext have to be installed here.
+
+def _pages_and_text(path):
+    out = subprocess.run(["pdfinfo", path], capture_output=True, text=True,
+                         timeout=120).stdout
+    m = re.search(r"^Pages:\s+(\d+)", out, re.M)
+    pages = int(m.group(1)) if m else 0
+    raw = subprocess.run(["pdftotext", "-q", path, "-"], capture_output=True,
+                         timeout=600).stdout.decode("utf-8", "replace")
+    chunks = raw.split("\f")[:-1] or [raw]
+    return pages, sum(1 for c in chunks if len(re.sub(r"\s", "", c)) >= MIN_CHARS)
+
+
+def previous_version(versions):
+    """The newest version that is not the current one.
+
+    Graph does not promise an order here, and relying on one would mean
+    comparing a file against itself and calling that a pass. Sort by date,
+    fall back to the numeric id."""
+    def key(v):
+        return (v.get("lastModifiedDateTime") or "",
+                [int(x) for x in re.findall(r"\d+", str(v.get("id", "")))] or [0])
+    ordered = sorted(versions, key=key, reverse=True)
+    return ordered[1] if len(ordered) > 1 else None
+
+
+def _fetch(path, target):
+    with open(target, "wb") as f:
+        f.write(g.call("GET", path, timeout=600))
+
+
+def cmd_audit(args):
+    db_init()
+    c = connection()
+    if shutil.which("pdfinfo") is None or shutil.which("pdftotext") is None:
+        g.die("audit reads PDFs here - install poppler-utils on the coordinator")
+    where, par = "", []
+    if args.ref:
+        where = " and path like ?"
+        par = [args.ref.split("/", 1)[-1].rstrip("/") + "%"]
+    order = "" if args.all else " order by random() limit ?"
+    if not args.all:
+        par = par + [args.sample]
+    rows = list(c.execute(
+        "select drive_id, item_id, path, pages, textpages_before, textpages_after "
+        "from ocr where result='ok'" + where + order, par))
+    if not rows:
+        print("nothing to audit - no finished files in the journal")
+        return
+    os.makedirs(WORK, exist_ok=True)
+    cur = os.path.join(WORK, "audit-current.pdf")
+    prev = os.path.join(WORK, "audit-previous.pdf")
+    ok = 0
+    problems = []
+    print(f"auditing {len(rows)} finished file(s)\n")
+    for drive_id, item_id, path, pages, t_before, t_after in rows:
+        try:
+            versions = g.get(f"/drives/{drive_id}/items/{item_id}/versions"
+                             ).get("value", [])
+            earlier = previous_version(versions)
+            if earlier is None:
+                problems.append((path, "no previous version - the original is "
+                                       "NOT recoverable"))
+                continue
+            _fetch(f"/drives/{drive_id}/items/{item_id}/content", cur)
+            _fetch(f"/drives/{drive_id}/items/{item_id}/versions/"
+                   f"{earlier['id']}/content", prev)
+            p_now, t_now = _pages_and_text(cur)
+            p_old, t_old = _pages_and_text(prev)
+        except Exception as e:
+            problems.append((path, f"could not be checked: {str(e)[:120]}"))
+            continue
+        if p_now == 0:
+            problems.append((path, "the current version is unreadable"))
+        elif p_now != p_old:
+            problems.append((path, f"page count changed: {p_old} -> {p_now}"))
+        elif t_now <= t_old:
+            problems.append((path, f"no text gained: {t_old} -> {t_now} text pages"))
+        else:
+            ok += 1
+            if args.verbose:
+                print(f"ok      {path}  {p_now}p  {t_old}->{t_now} text pages")
+    for f in (cur, prev):
+        os.path.exists(f) and os.remove(f)
+    for path, why in problems:
+        print(f"PROBLEM {path}  [{why}]", file=sys.stderr)
+    print(f"\n{ok} of {len(rows)} verified, {len(problems)} problem(s)")
+    if problems:
+        print("The previous version in the cloud is still the original - nothing "
+              "here is lost, but these files deserve a look.", file=sys.stderr)
+        sys.exit(1)
 
 
 def cmd_refresh(args):
@@ -693,6 +872,14 @@ def main():
     p.add_argument("ref", nargs="?")
     p.add_argument("--limit", type=int, default=20)
     p.set_defaults(fn=cmd_report)
+
+    p = sub.add_parser("audit", help="re-check finished files against their "
+                                     "previous version")
+    p.add_argument("ref", nargs="?")
+    p.add_argument("--sample", type=int, default=20, help="how many to draw")
+    p.add_argument("--all", action="store_true", help="check every finished file")
+    p.add_argument("-v", "--verbose", action="store_true")
+    p.set_defaults(fn=cmd_audit)
 
     p = sub.add_parser("refresh", help="update stored cTags (metadata only)")
     p.add_argument("ref")

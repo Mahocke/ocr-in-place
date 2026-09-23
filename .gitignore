@@ -5,3 +5,4 @@ __pycache__/
 *.sqlite-shm
 *.csv
 config.ini
+tests/corpus/

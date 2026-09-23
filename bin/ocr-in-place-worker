@@ -16,8 +16,10 @@ Result:  {"id", "ok", "status", "pages", "textpages", ...}
 
 Standard library only. Needs ocrmypdf, tesseract and poppler-utils on PATH.
 """
+import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -34,6 +36,45 @@ os.environ["PATH"] = ("/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:"
 MIN_CHARS = 50          # a page counts as "has text" from this many characters
 BLOCK = 8 * 1024 * 1024
 TOOLS = ("ocrmypdf", "tesseract", "pdftotext", "pdfinfo", "pdfsig")
+
+
+# ---------- toolchain ----------
+
+# Every tool that can change the bytes we upload, not just ocrmypdf. qpdf 12
+# rejects damaged JPEG data that qpdf 11 passed through, and Ghostscript is
+# what rebuilds those pages on the PDF/A path - "worker A has ocrmypdf 16.7"
+# is not enough to reproduce a result months later.
+VERSION_CMDS = {
+    "ocrmypdf": (["ocrmypdf", "--version"], r"([0-9][0-9.a-z+-]*)"),
+    "tesseract": (["tesseract", "--version"], r"tesseract\s+([0-9][0-9.a-z+-]*)"),
+    "ghostscript": (["gs", "--version"], r"([0-9][0-9.]*)"),
+    "qpdf": (["qpdf", "--version"], r"qpdf version\s+([0-9][0-9.a-z+-]*)"),
+    "poppler": (["pdftotext", "-v"], r"pdftotext version\s+([0-9][0-9.a-z+-]*)"),
+}
+_toolchain = None
+
+
+def toolchain():
+    """Versions of everything that touches the bytes, plus the platform.
+
+    Measured once per worker process: five subprocess calls per file would be
+    a noticeable tax on a run of tens of thousands."""
+    global _toolchain
+    if _toolchain is not None:
+        return _toolchain
+    out = {}
+    for name, (cmd, pattern) in VERSION_CMDS.items():
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            m = re.search(pattern, (r.stdout or "") + "\n" + (r.stderr or ""))
+            out[name] = m.group(1) if m else "?"
+        except Exception:
+            out[name] = "-"          # not installed
+    out["platform"] = "%s-%s" % (platform.system().lower(), platform.machine())
+    out["id"] = hashlib.sha256(
+        json.dumps(out, sort_keys=True).encode()).hexdigest()[:8]
+    _toolchain = out
+    return out
 
 
 class Throttled(RuntimeError):
@@ -180,10 +221,10 @@ def ocr(source, target, job):
 
 def handle(job, workdir, ask=None):
     if job.get("mode") == "probe":
-        v = subprocess.run(["ocrmypdf", "--version"],
-                           capture_output=True, text=True).stdout.strip()
+        tc = toolchain()
         missing = [t for t in TOOLS if shutil.which(t) is None]
-        return {"id": job.get("id"), "ok": not missing, "ocrmypdf": v,
+        return {"id": job.get("id"), "ok": not missing, "ocrmypdf": tc["ocrmypdf"],
+                "toolchain": tc,
                 "error": ("missing: " + ", ".join(missing)) if missing else None}
 
     source = os.path.join(workdir, "in.pdf")
@@ -202,6 +243,7 @@ def handle(job, workdir, ask=None):
         res["seconds"] = round(time.time() - t0, 1)
         return res
 
+    res["toolchain"] = toolchain()
     res["output"] = ocr(source, target, job)
     n_status, n_pages, n_text, n_note = classify(target)
     res["size_after"] = os.path.getsize(target)

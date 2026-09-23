@@ -112,6 +112,27 @@ Patching it afterwards with a separate `PATCH` also works — and creates a
 *second* version, which defeats the point. Use `--no-keep-mtime` if you would
 rather see when the OCR happened.
 
+## Which versions produced a file
+
+Every processed file records the whole toolchain - ocrmypdf, tesseract,
+Ghostscript, qpdf, poppler and the platform - stored once per distinct set in
+a `toolchains` table and referenced from the `ocr` row by a short hash.
+
+This is not bookkeeping for its own sake. What survives a damaged scan is
+decided by qpdf and Ghostscript at least as much as by ocrmypdf, so
+"worker A has ocrmypdf 16.7" does not let you reproduce a result months later.
+`ocr-in-place workers` warns when the workers disagree, and `report` lists the
+toolchains that did the work.
+
+## Checking afterwards
+
+`audit` samples files the journal calls finished, downloads the current version
+and the one before it, and verifies the claim: page count held, text really
+present, and a previous version still there to restore. It picks the earlier
+version by date rather than by position in the list - Graph makes no promise
+about the order, and taking element [1] on faith would mean comparing a file
+with itself and calling that a pass.
+
 ## Delta runs
 
 `scan` stores a cTag per file. On the next run, anything whose cTag is
