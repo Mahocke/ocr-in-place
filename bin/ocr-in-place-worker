@@ -48,10 +48,47 @@ VERSION_CMDS = {
     "ocrmypdf": (["ocrmypdf", "--version"], r"([0-9][0-9.a-z+-]*)"),
     "tesseract": (["tesseract", "--version"], r"tesseract\s+([0-9][0-9.a-z+-]*)"),
     "ghostscript": (["gs", "--version"], r"([0-9][0-9.]*)"),
-    "qpdf": (["qpdf", "--version"], r"qpdf version\s+([0-9][0-9.a-z+-]*)"),
     "poppler": (["pdftotext", "-v"], r"pdftotext version\s+([0-9][0-9.a-z+-]*)"),
 }
 _toolchain = None
+
+
+def _libqpdf():
+    """The qpdf that actually decides what survives a damaged scan.
+
+    ocrmypdf reaches qpdf through pikepdf, so the linked libqpdf is the
+    version that matters - and it is not always the one the command line tool
+    reports, which on many machines is not installed at all. Ask the very
+    interpreter that runs ocrmypdf, found through its shebang."""
+    interpreters = []
+    exe = shutil.which("ocrmypdf")
+    if exe:
+        try:
+            with open(exe) as f:
+                first = f.readline()
+            if first.startswith("#!"):
+                interpreters.append(first[2:].strip().split()[0])
+        except OSError:
+            pass
+    interpreters += [sys.executable, "python3"]
+    for py in interpreters:
+        try:
+            r = subprocess.run(
+                [py, "-c", "import pikepdf;print(pikepdf.__libqpdf_version__)"],
+                capture_output=True, text=True, timeout=30)
+            if r.returncode == 0 and r.stdout.strip():
+                return r.stdout.strip()
+        except Exception:
+            pass
+    try:                                   # last resort: the command line tool
+        r = subprocess.run(["qpdf", "--version"], capture_output=True,
+                           text=True, timeout=30)
+        m = re.search(r"qpdf version\s+([0-9][0-9.a-z+-]*)", r.stdout or "")
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return "-"
 
 
 def toolchain():
@@ -70,6 +107,7 @@ def toolchain():
             out[name] = m.group(1) if m else "?"
         except Exception:
             out[name] = "-"          # not installed
+    out["qpdf"] = _libqpdf()
     out["platform"] = "%s-%s" % (platform.system().lower(), platform.machine())
     out["id"] = hashlib.sha256(
         json.dumps(out, sort_keys=True).encode()).hexdigest()[:8]
