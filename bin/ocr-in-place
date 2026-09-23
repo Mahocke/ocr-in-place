@@ -728,12 +728,17 @@ def _pages_and_text(path):
 def previous_version(versions):
     """The newest version that is not the current one.
 
-    Graph does not promise an order here, and relying on one would mean
-    comparing a file against itself and calling that a pass. Sort by date,
-    fall back to the numeric id."""
+    Order by version id, NOT by date. The dates lie here, and they lie because
+    of us: --keep-mtime writes the original document's timestamp onto the new
+    version, while the superseded content gets stamped with the moment it
+    became a version. A file we OCR'd in 2026 can therefore have a current
+    version dated 2019 sitting above a previous version dated 2026. Sorting by
+    date picks the current version, and Graph answers "You cannot get the
+    content of the current version."
+
+    Graph does not promise an order in the list either, so sort explicitly."""
     def key(v):
-        return (v.get("lastModifiedDateTime") or "",
-                [int(x) for x in re.findall(r"\d+", str(v.get("id", "")))] or [0])
+        return [int(x) for x in re.findall(r"\d+", str(v.get("id", "")))] or [0]
     ordered = sorted(versions, key=key, reverse=True)
     return ordered[1] if len(ordered) > 1 else None
 
@@ -782,7 +787,11 @@ def cmd_audit(args):
             p_now, t_now = _pages_and_text(cur)
             p_old, t_old = _pages_and_text(prev)
         except Exception as e:
-            problems.append((path, f"could not be checked: {str(e)[:120]}"))
+            # Keep the end of the message: GraphError puts the long item path
+            # in front, and truncating from the left throws the HTTP status
+            # away - which is the only part worth reading.
+            msg = str(e).split(" -> ")[-1]
+            problems.append((path, f"could not be checked: {msg[:160]}"))
             continue
         if p_now == 0:
             problems.append((path, "the current version is unreadable"))

@@ -251,8 +251,10 @@ class CoordinatorCase(unittest.TestCase):
         self.assertIn("0 problem(s)", out)
 
     def test_audit_compares_against_the_real_previous_version(self):
-        # The fake returns versions oldest first. Taking element [1] would
-        # compare the current file with itself and pass on anything.
+        # The fake returns versions oldest first, and - as production does -
+        # gives the CURRENT version the oldest date, because --keep-mtime put
+        # the original timestamp there. Picking by position or by date lands
+        # on the current version, which the fake refuses just like Graph.
         self.scan()
         self.run_ocr()
         item = self.puts()[0][1]
@@ -261,6 +263,15 @@ class CoordinatorCase(unittest.TestCase):
                             self.cloud.history[item][-1])
         code, out = self.audit()
         self.assertEqual(code, 0, out)
+
+    def test_audit_picks_the_previous_version_by_id_not_by_date(self):
+        vs = [{"id": "1.0", "lastModifiedDateTime": "2026-09-03T14:13:40Z"},
+              {"id": "2.0", "lastModifiedDateTime": "2024-12-11T09:41:11Z"}]
+        self.assertEqual(self.coord.previous_version(vs)["id"], "1.0")
+        self.assertEqual(self.coord.previous_version(list(reversed(vs)))["id"], "1.0")
+        three = vs + [{"id": "3.0", "lastModifiedDateTime": "2019-01-01T00:00:00Z"}]
+        self.assertEqual(self.coord.previous_version(three)["id"], "2.0")
+        self.assertIsNone(self.coord.previous_version(vs[:1]))
 
     def test_audit_catches_a_missing_version_history(self):
         self.scan()

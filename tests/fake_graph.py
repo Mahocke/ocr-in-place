@@ -165,6 +165,11 @@ def serve(cloud):
                 idx = int(float(vid)) - 1
                 if not (0 <= idx < len(hist)):
                     return self._send(404)
+                if idx == len(hist) - 1:
+                    # Graph refuses this, and so must the fake - otherwise a
+                    # caller that asks for the current version passes.
+                    return self._send(400, b'{"error":{"message":"You cannot get '
+                                           b'the content of the current version."}}')
                 return self._send(200, hist[idx], "application/pdf")
 
             # the current bytes
@@ -178,11 +183,18 @@ def serve(cloud):
             if rest.endswith("/versions"):
                 item = rest.split("/items/")[1].split("/")[0]
                 n = cloud.versions.get(item, 0)
-                # Deliberately oldest first, with real timestamps: a caller that
-                # simply takes element [1] would compare the file with itself.
+                # Deliberately awkward, exactly as production is:
+                #  * oldest first, so taking element [1] compares the file
+                #    with itself
+                #  * the CURRENT version carries the OLDEST date, because
+                #    --keep-mtime puts the original timestamp on it while the
+                #    superseded content is stamped with the moment it was
+                #    superseded. Sorting by date therefore picks the current
+                #    version, which Graph refuses to hand out.
                 return self._json({"value": [
                     {"id": "%d.0" % (i + 1),
-                     "lastModifiedDateTime": "2019-05-%02dT10:00:00Z" % (i + 1)}
+                     "lastModifiedDateTime": ("2019-05-04T10:00:00Z" if i == n - 1
+                                              else "2026-09-%02dT10:00:00Z" % (i + 1))}
                     for i in range(n)]})
 
             # /drives/<id>/items/<item>
