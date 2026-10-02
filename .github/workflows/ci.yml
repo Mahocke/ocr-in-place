@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install OCR tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y ocrmypdf tesseract-ocr poppler-utils qpdf
+      - name: Check Python and shell syntax
+        run: |
+          python3 -m compileall -q bin lib tests
+          bash -n examples/*.sh tests/run-tests.sh
+      - name: Run safety test suite
+        run: tests/run-tests.sh
