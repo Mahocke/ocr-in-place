@@ -226,8 +226,13 @@ def classify(path):
 def _run_ocr(source, target, job, kind):
     cmd = ["nice", "-n", str(job.get("nice", 10)), "ocrmypdf", "--skip-text",
            "-l", job.get("lang", "eng"), "--jobs", str(job.get("jobs", 3)),
-           "--output-type", kind, "--tesseract-timeout", "600", "--quiet",
-           source, target]
+           "--output-type", kind, "--tesseract-timeout", "600", "--quiet"]
+    if kind == "pdfa":
+        # On the PDF/A path Ghostscript rebuilds every page and refuses unusual
+        # colour spaces (ColorConversionNeededError). Converting to RGB keeps
+        # the repair path open for those files; the 'pdf' path never gets here.
+        cmd += ["--color-conversion-strategy", "RGB"]
+    cmd += [source, target]
     r = subprocess.run(cmd, capture_output=True, timeout=job.get("timeout", 3600))
     if r.returncode != 0:
         raise OcrError(r.returncode,

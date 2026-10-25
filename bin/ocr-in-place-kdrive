@@ -192,7 +192,12 @@ class OcrError(RuntimeError):
 def _run_ocr(src, dst, lang, jobs, kind, timeout):
     cmd = ["nice", "-n", "10", "ocrmypdf", "--skip-text", "-l", lang,
            "--jobs", str(jobs), "--output-type", kind,
-           "--tesseract-timeout", "600", "--quiet", src, dst]
+           "--tesseract-timeout", "600", "--quiet"]
+    if kind == "pdfa":
+        # Ghostscript refuses unusual colour spaces on the PDF/A path
+        # (ColorConversionNeededError); RGB keeps the repair path open.
+        cmd += ["--color-conversion-strategy", "RGB"]
+    cmd += [src, dst]
     r = subprocess.run(cmd, capture_output=True, timeout=timeout)
     if r.returncode != 0:
         raise OcrError(r.returncode,
